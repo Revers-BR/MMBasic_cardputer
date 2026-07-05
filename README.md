@@ -23,16 +23,16 @@ This ported firmware retains the original copyright notice of MMBasic. All copyr
 
 ## 1.0.2 Release Notes
 
-** Turtle Graphics **
+**Turtle Graphics**
 The turtle implementation should now be complete (please let me know if you encounter any bugs).
 
-** New Features (mostly aligned with the picomite implementation) **
+**New Features (mostly aligned with the picomite implementation)**
 - `ARC`
 - `BEGIN FILL` / `END FILL`
 - `SET X`
 - `SET Y`
 
-** Bug Fixes in turtle **
+**Bug Fixes in turtle**
 - Cursor‑related issues
 - `TDRAWLINE`
 - `TARC`
@@ -41,12 +41,12 @@ The turtle implementation should now be complete (please let me know if you enco
 
 ### Additional Changes
 
-** New Commands **
+**New Commands**
 - `FIX`
 - `CHOICE`
 - `BOUND`
 
-** Bug Fixes **
+**Bug Fixes**
 - Fixed a potential bug in `REM` line handling.
 - Fixed an issue related to `TMATCH` (also addressed side effects affecting `PEN`, `CURSOR`, `FILL`, and `SET`).
 
