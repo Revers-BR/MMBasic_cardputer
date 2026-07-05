@@ -277,6 +277,9 @@ const struct s_tokentbl commandtbl[] = {
     {"PIXEL", C_FUNC, F_POINT, NULL},
     {"EVAL$", C_FUNC, F_EVAL, NULL},
     {"BASE$", C_FUNC, F_BASE, NULL},
+    {"FIX", C_FUNC, F_FIX, NULL},
+    {"CHOICE", C_FUNC, F_CHOICE, NULL},
+    {"BOUND", C_FUNC, F_BOUND, NULL},
     {"", 0, 0, NULL}
 };
 
@@ -657,6 +660,13 @@ void MMBasic_Execute(char *line) {
                 scan++;
                 while (*scan && *scan != '"') scan++;
                 if (*scan == '"') scan++;
+            } else if (*scan == '\'') {
+                break; // comment - stop scanning
+            } else if ((*scan == 'R' || *scan == 'r') &&
+                       (scan[1] == 'E' || scan[1] == 'e') &&
+                       (scan[2] == 'M' || scan[2] == 'm') &&
+                       (scan == line || *(scan-1) == ' ' || *(scan-1) == '\t')) {
+                break; // REM comment - stop scanning
             } else if (*scan == ':') {
                 colonPos = scan;
                 break;
@@ -1656,7 +1666,7 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
             break;
         case F_INT:
             *itype = T_INT;
-            *ival = (int)numVal;
+            *ival = (int)floor(numVal);
             *fval = (float)*ival;
             break;
         case F_SGN:
@@ -2120,6 +2130,56 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
             *ival = M5Cardputer.Display.readPixel(arg1Ival, arg2Ival) & 0xFFFF;
             *fval = *ival;
             break;
+        case F_FIX:
+            *itype = T_INT;
+            if (arg1Type == T_INT) *ival = arg1Ival;
+            else *ival = (int)arg1Fval;  // truncate toward zero
+            *fval = (float)*ival;
+            break;
+        case F_CHOICE: {
+            // CHOICE(cond, true_val, false_val) - args already parsed as arg1, arg2, arg3
+            // But we need to evaluate only the selected branch as expression strings
+            // Since args are already evaluated, use arg2 if cond is nonzero, arg3 otherwise
+            int cond = (arg1Type == T_STR) ? (arg1Sval && arg1Sval[0]) : arg1Ival;
+            if (cond) {
+                *itype = arg2Type;
+                *ival = arg2Ival; *fval = arg2Fval;
+                if (arg2Type == T_STR && arg2Sval) {
+                    *sval = MMBasic_GetTempString();
+                    strncpy(*sval, arg2Sval, STRINGSIZE - 1);
+                    (*sval)[STRINGSIZE - 1] = '\0';
+                }
+            } else {
+                *itype = arg3Type;
+                *ival = arg3Ival; *fval = arg3Fval;
+                if (arg3Type == T_STR && arg3Sval) {
+                    *sval = MMBasic_GetTempString();
+                    strncpy(*sval, arg3Sval, STRINGSIZE - 1);
+                    (*sval)[STRINGSIZE - 1] = '\0';
+                }
+            }
+            break;
+        }
+        case F_BOUND: {
+            // BOUND("varname") or BOUND("varname", dim)
+            // Takes variable name as string literal
+            *itype = T_INT;
+            *ival = 0;
+            int which = hasArg2 ? arg2Ival : 1;
+            if (arg1Type == T_STR && arg1Sval && arg1Sval[0]) {
+                char name[MAXVARLEN + 1];
+                strncpy(name, arg1Sval, MAXVARLEN);
+                name[MAXVARLEN] = '\0';
+                for (int j = 0; name[j]; j++)
+                    if (name[j] >= 'a' && name[j] <= 'z') name[j] -= 32;
+                int vi = MMBasic_FindVariable(name);
+                if (vi >= 0 && vartbl[vi].array > 0) {
+                    *ival = (which == 0) ? 0 : vartbl[vi].array;
+                }
+            }
+            *fval = (float)*ival;
+            break;
+        }
         default:
             MMBasic_Error(ERR_SYNTAX, "Unknown function");
             return 1;
