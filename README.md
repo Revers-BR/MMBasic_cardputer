@@ -20,6 +20,37 @@ This ported firmware retains the original copyright notice of MMBasic. All copyr
 - SD card read/write
 - The most important part: the core interpreter
 
+
+## 1.0.2 Release Notes
+
+** Turtle Graphics **
+The turtle implementation should now be complete (please let me know if you encounter any bugs).
+
+** New Features (mostly aligned with the picomite implementation) **
+- `ARC`
+- `BEGIN FILL` / `END FILL`
+- `SET X`
+- `SET Y`
+
+** Bug Fixes in turtle **
+- Cursor‑related issues
+- `TDRAWLINE`
+- `TARC`
+- Scanline logic, as well as `TFORWARD` and `TGOTO` – re‑synced with the picomite codebase
+- `SET`‑related commands
+
+### Additional Changes
+
+** New Commands **
+- `FIX`
+- `CHOICE`
+- `BOUND`
+
+** Bug Fixes **
+- Fixed a potential bug in `REM` line handling.
+- Fixed an issue related to `TMATCH` (also addressed side effects affecting `PEN`, `CURSOR`, `FILL`, and `SET`).
+
+
 ## Version 1.0.01 Notes
 - SPRITE added and tested
 - GPIO implemented using Arduino standard library, but not yet tested
