@@ -167,6 +167,9 @@
 #define F_TOUCH     0x35
 #define F_EVAL      0x36
 #define F_BASE      0x37
+#define F_FIX       0x38
+#define F_CHOICE    0x39
+#define F_BOUND     0x3A
 
 // Operator tokens (used internally in expression evaluator, not in token table)
 #define OP_PLUS      0x01
