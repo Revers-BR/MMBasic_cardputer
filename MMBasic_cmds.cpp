@@ -3159,79 +3159,233 @@ void ScanSubFunDefs(void) {
     }
 }
 
-// ============ TURTLE Graphics ============
+// ============ TURTLE Graphics (ported from PicoMite) ============
+#define T_HRES 240
+#define T_VRES 134
+#define T_MAX_POLY 128
+#define T_MAX_CURSOR_BUF 50*50*2
+
 struct TurtleState {
     float x, y, heading;
     int penDown, penColor, penWidth;
+    int fillColor, fillEnabled, fillPattern;
     int visible, cursorSize, cursorColor;
-    float oldX, oldY, oldHeading;
-    int oldCursorSize, oldCursorColor;
-    int fillColor, fillEnabled;
+    int cursorX, cursorY; float cursorHeading; int cursorDrawn;
+    unsigned char *cursorBuf;
+    int cursorBufX1, cursorBufY1, cursorBufX2, cursorBufY2;
+    float stackX[16], stackY[16], stackH[16]; int stackPtr;
+    int polyX[T_MAX_POLY], polyY[T_MAX_POLY], polyCount, polyRecording;
 };
-static TurtleState t = {120, 67, 0, 1, 0xFFFF, 1, 0, 5, 0x07E0, 120, 67, 0, 5, 0x07E0, 0xFFFF, 0};
-static float tStackX[16], tStackY[16], tStackH[16]; static int tStackPtr = 0;
+static TurtleState t;
+
+// --- Drawing helpers adapted for M5Cardputer ---
+
+// Thick line with perpendicular offset (PicoMite convention: negative width = centered)
+static void tDrawLine(int x1, int y1, int x2, int y2, int width, uint16_t color) {
+    if (width == 1) {
+        M5Cardputer.Display.drawLine(x1, y1, x2, y2, color);
+        return;
+    }
+    int w = abs(width);
+    float dx = (float)(x2 - x1), dy = (float)(y2 - y1);
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 0.5f) { M5Cardputer.Display.drawPixel(x1, y1, color); return; }
+    float nx = -dy / len, ny = dx / len;
+    int half = w / 2;
+    for (int i = -half; i <= half; i++) {
+        int ox = (int)(nx * i + 0.5f), oy = (int)(ny * i + 0.5f);
+        M5Cardputer.Display.drawLine(x1 + ox, y1 + oy, x2 + ox, y2 + oy, color);
+    }
+}
+
+static void tDrawPixel(int x, int y, uint16_t color) {
+    if (x >= 0 && x < T_HRES && y >= 0 && y < T_VRES)
+        M5Cardputer.Display.drawPixel(x, y, color);
+}
+
+static float tNormalizeHeading(float h) {
+    while (h < 0) h += 360.0f;
+    while (h >= 360.0f) h -= 360.0f;
+    return h;
+}
+
+// --- Cursor with pixel save/restore ---
+static void tEraseCursor(void) {
+    if (!t.cursorDrawn) return;
+    // Restore saved pixels
+    if (t.cursorBuf) {
+        int idx = 0;
+        for (int y = t.cursorBufY1; y <= t.cursorBufY2; y++)
+            for (int x = t.cursorBufX1; x <= t.cursorBufX2; x++) {
+                uint16_t c = (t.cursorBuf[idx] << 8) | t.cursorBuf[idx + 1];
+                if (x >= 0 && x < T_HRES && y >= 0 && y < T_VRES)
+                    M5Cardputer.Display.drawPixel(x, y, c);
+                idx += 2;
+            }
+        free(t.cursorBuf); t.cursorBuf = NULL;
+    } else {
+        // Fallback: draw black triangle
+        float rad = t.cursorHeading * 3.14159f / 180.0f;
+        int x1 = t.cursorX + (int)(t.cursorSize * sin(rad));
+        int y1 = t.cursorY - (int)(t.cursorSize * cos(rad));
+        float al = (t.cursorHeading + 150) * 3.14159f / 180.0f;
+        int x2 = t.cursorX + (int)(t.cursorSize * 0.6f * sin(al));
+        int y2 = t.cursorY - (int)(t.cursorSize * 0.6f * cos(al));
+        float ar = (t.cursorHeading - 150) * 3.14159f / 180.0f;
+        int x3 = t.cursorX + (int)(t.cursorSize * 0.6f * sin(ar));
+        int y3 = t.cursorY - (int)(t.cursorSize * 0.6f * cos(ar));
+        tDrawLine(x1, y1, x2, y2, 1, 0);
+        tDrawLine(x2, y2, x3, y3, 1, 0);
+        tDrawLine(x3, y3, x1, y1, 1, 0);
+    }
+    t.cursorDrawn = 0;
+}
 
 static void tDrawCursor(void) {
     if (!t.visible) return;
+    int cx = (int)t.x, cy = (int)t.y;
+    // Check if redraw is needed
+    static int lastSize = 0, lastColor = 0;
+    bool needsRedraw = !t.cursorDrawn ||
+                       cx != t.cursorX || cy != t.cursorY ||
+                       t.heading != t.cursorHeading ||
+                       t.cursorSize != lastSize || t.cursorColor != lastColor;
+    if (!needsRedraw) return;
+    lastSize = t.cursorSize; lastColor = t.cursorColor;
+    // Erase old cursor first
+    if (t.cursorDrawn) tEraseCursor();
     float rad = t.heading * 3.14159f / 180.0f;
-    float s6 = t.cursorSize * 0.6f;
-    int tx = (int)t.x, ty = (int)t.y;
-    int fx = tx + (int)(t.cursorSize * sin(rad));
-    int fy = ty - (int)(t.cursorSize * cos(rad));
-    int lx = tx + (int)(s6 * sin(rad + 2.618f));   // +150 deg
-    int ly = ty - (int)(s6 * cos(rad + 2.618f));
-    int rx = tx + (int)(s6 * sin(rad - 2.618f));   // -150 deg
-    int ry = ty - (int)(s6 * cos(rad - 2.618f));
-    M5Cardputer.Display.drawLine(fx, fy, lx, ly, t.cursorColor);
-    M5Cardputer.Display.drawLine(lx, ly, rx, ry, t.cursorColor);
-    M5Cardputer.Display.drawLine(rx, ry, fx, fy, t.cursorColor);
-    t.oldX = t.x; t.oldY = t.y; t.oldHeading = t.heading;
-    t.oldCursorSize = t.cursorSize; t.oldCursorColor = t.cursorColor;
-}
-static void tEraseCursor(void) {
-    if (!t.visible) return;
-    float rad = t.oldHeading * 3.14159f / 180.0f;
-    int tx = (int)t.oldX, ty = (int)t.oldY, sz = t.oldCursorSize;
-    int fx = tx + (int)(sz * sin(rad));
-    int fy = ty - (int)(sz * cos(rad));
-    float s6 = sz * 0.6f;
-    int lx = tx + (int)(s6 * sin(rad + 2.618f));
-    int ly = ty - (int)(s6 * cos(rad + 2.618f));
-    int rx = tx + (int)(s6 * sin(rad - 2.618f));
-    int ry = ty - (int)(s6 * cos(rad - 2.618f));
-    int x1 = min(min(fx, lx), rx); int x2 = max(max(fx, lx), rx);
-    int y1 = min(min(fy, ly), ry); int y2 = max(max(fy, ly), ry);
-    M5Cardputer.Display.fillRect(x1, y1, x2-x1+1, y2-y1+1, 0);
-}
-static void tMove(float dist) {
-    if (fabs(dist) < 0.01f) return;
-    float ox = t.x, oy = t.y;
-    float rad = t.heading * 3.14159f / 180.0f;
-    float s = sin(rad), c = cos(rad);
-    if (fabs(fmod(t.heading + 0.001f, 90.0f)) < 0.002f) {
-        int q = (int)((t.heading + 0.001f) / 90.0f) % 4;
-        if (q == 0) { s = 0; c = 1; }
-        else if (q == 1) { s = 1; c = 0; }
-        else if (q == 2) { s = 0; c = -1; }
-        else { s = -1; c = 0; }
+    int x1 = cx + (int)(t.cursorSize * sin(rad));
+    int y1 = cy - (int)(t.cursorSize * cos(rad));
+    float al = (t.heading + 150) * 3.14159f / 180.0f;
+    int x2 = cx + (int)(t.cursorSize * 0.6f * sin(al));
+    int y2 = cy - (int)(t.cursorSize * 0.6f * cos(al));
+    float ar = (t.heading - 150) * 3.14159f / 180.0f;
+    int x3 = cx + (int)(t.cursorSize * 0.6f * sin(ar));
+    int y3 = cy - (int)(t.cursorSize * 0.6f * cos(ar));
+    // Bounding box
+    int bx1 = min(min(x1, x2), x3) - 2, by1 = min(min(y1, y2), y3) - 2;
+    int bx2 = max(max(x1, x2), x3) + 2, by2 = max(max(y1, y2), y3) + 2;
+    if (bx1 < 0) bx1 = 0; if (by1 < 0) by1 = 0;
+    if (bx2 >= T_HRES) bx2 = T_HRES - 1; if (by2 >= T_VRES) by2 = T_VRES - 1;
+    // Save background
+    int bw = bx2 - bx1 + 1, bh = by2 - by1 + 1;
+    t.cursorBuf = (unsigned char*)malloc(bw * bh * 2);
+    if (t.cursorBuf) {
+        int idx = 0;
+        for (int y = by1; y <= by2; y++)
+            for (int x = bx1; x <= bx2; x++) {
+                uint16_t c = M5Cardputer.Display.readPixel(x, y);
+                t.cursorBuf[idx++] = c >> 8; t.cursorBuf[idx++] = c & 0xFF;
+            }
+        t.cursorBufX1 = bx1; t.cursorBufY1 = by1;
+        t.cursorBufX2 = bx2; t.cursorBufY2 = by2;
     }
-    t.x += dist * s;
-    t.y -= dist * c;
-    if (t.penDown && t.penWidth > 0) {
-        for (int i = 0; i < t.penWidth; i++)
-            M5Cardputer.Display.drawLine((int)ox + i, (int)oy, (int)t.x + i, (int)t.y, t.penColor);
-    }
-    tDrawCursor();
-}
-static void tLineTo(float nx, float ny) {
-    if (t.penDown && t.penWidth > 0) {
-        for (int i = 0; i < t.penWidth; i++)
-            M5Cardputer.Display.drawLine((int)t.x + i, (int)t.y, (int)nx + i, (int)ny, t.penColor);
-    }
-    t.x = nx; t.y = ny;
-    tDrawCursor();
+    tDrawLine(x1, y1, x2, y2, 1, t.cursorColor);
+    tDrawLine(x2, y2, x3, y3, 1, t.cursorColor);
+    tDrawLine(x3, y3, x1, y1, 1, t.cursorColor);
+    t.cursorX = cx; t.cursorY = cy; t.cursorHeading = t.heading;
+    t.cursorDrawn = 1;
 }
 
+// --- Core movement (ported from PicoMite) ---
+static void tForward(float dist) {
+    if (fabs(dist) < 0.001f) return;
+    float ox = t.x, oy = t.y;
+    float rad = t.heading * 3.14159f / 180.0f;
+    t.x += dist * sin(rad);
+    t.y -= dist * cos(rad);
+    if (t.penDown)
+        tDrawLine((int)ox, (int)oy, (int)t.x, (int)t.y, -t.penWidth, t.penColor);
+    if (t.polyRecording && t.polyCount < T_MAX_POLY - 1) {
+        t.polyX[t.polyCount] = (int)t.x;
+        t.polyY[t.polyCount] = (int)t.y;
+        t.polyCount++;
+    }
+    if (t.visible) tDrawCursor();
+}
+
+static void tGoto(float nx, float ny) {
+    float ox = t.x, oy = t.y;
+    t.x = nx; t.y = ny;
+    if (t.penDown)
+        tDrawLine((int)ox, (int)oy, (int)nx, (int)ny, -t.penWidth, t.penColor);
+    if (t.polyRecording && t.polyCount < T_MAX_POLY - 1) {
+        t.polyX[t.polyCount] = (int)nx;
+        t.polyY[t.polyCount] = (int)ny;
+        t.polyCount++;
+    }
+    if (t.visible) tDrawCursor();
+}
+
+static void tArc(float radius, float angle) {
+    int segments = (int)(fabs(angle) / 5.0f) + 1;
+    if (segments < 4) segments = 4;
+    float step = angle / segments;
+    float dist = 2.0f * radius * sin((step * 3.14159f / 180.0f) / 2.0f);
+    for (int i = 0; i < segments; i++) {
+        tForward(dist);
+        t.heading = tNormalizeHeading(t.heading + step);
+    }
+}
+
+// --- Scanline polygon fill (from PicoMite) ---
+static void tFillScanline(int *px, int *py, int count, uint16_t color) {
+    int minY = py[0], maxY = py[0];
+    for (int i = 1; i < count; i++) {
+        if (py[i] < minY) minY = py[i];
+        if (py[i] > maxY) maxY = py[i];
+    }
+    for (int sy = minY; sy <= maxY; sy++) {
+        int inter[128]; int ic = 0;
+        for (int i = 0; i < count; i++) {
+            int next = (i + 1) % count;
+            int y1 = py[i], y2 = py[next];
+            if ((y1 <= sy && y2 > sy) || (y2 <= sy && y1 > sy)) {
+                int ix = px[i] + (sy - y1) * (px[next] - px[i]) / (y2 - y1);
+                if (ic < 128) inter[ic++] = ix;
+            }
+        }
+        for (int i = 0; i < ic - 1; i++)
+            for (int j = i + 1; j < ic; j++)
+                if (inter[i] > inter[j]) { int tmp = inter[i]; inter[i] = inter[j]; inter[j] = tmp; }
+        for (int i = 0; i < ic - 1; i += 2)
+            tDrawLine(inter[i], sy, inter[i + 1], sy, 1, color);
+    }
+}
+
+static void tDrawFilledPolygon(void) {
+    if (t.polyCount < 3) return;
+    // Close polygon
+    if (t.polyX[0] != t.polyX[t.polyCount - 1] || t.polyY[0] != t.polyY[t.polyCount - 1]) {
+        if (t.polyCount < T_MAX_POLY - 1) {
+            t.polyX[t.polyCount] = t.polyX[0];
+            t.polyY[t.polyCount] = t.polyY[0];
+            t.polyCount++;
+        }
+    }
+    tFillScanline(t.polyX, t.polyY, t.polyCount, t.fillColor);
+    if (t.penDown) {
+        for (int i = 0; i < t.polyCount - 1; i++)
+            tDrawLine(t.polyX[i], t.polyY[i], t.polyX[i+1], t.polyY[i+1], -t.penWidth, t.penColor);
+    }
+}
+
+static void tReset(bool show) {
+    if (t.visible && t.cursorDrawn) { t.visible = 0; tEraseCursor(); }
+    M5Cardputer.Display.fillScreen(0);
+    t.x = T_HRES / 2; t.y = T_VRES / 2; t.heading = 0;
+    t.penDown = 1; t.penColor = 0xFFFF; t.penWidth = 1;
+    t.fillColor = 0xFFFF; t.fillEnabled = 0; t.fillPattern = 0;
+    t.cursorSize = 10; t.cursorColor = 0x07E0;
+    t.cursorX = 0; t.cursorY = 0; t.cursorHeading = 0; t.cursorDrawn = 0;
+    if (t.cursorBuf) { free(t.cursorBuf); t.cursorBuf = NULL; }
+    t.stackPtr = 0; t.polyCount = 0; t.polyRecording = 0;
+    t.visible = show;
+    if (t.visible) tDrawCursor();
+}
+
+// --- Keyword matcher ---
 static bool tMatch(char **p, const char *word) {
     char *s = *p;
     while (*s == ' ') s++;
@@ -3240,123 +3394,130 @@ static bool tMatch(char **p, const char *word) {
         char c = s[i]; if (c >= 'a' && c <= 'z') c -= 32;
         if (c != word[i]) return false;
     }
-    if (s[len] != ' ' && s[len] != '\0' && s[len] != '\n' && s[len] != '\r') return false;
+    if (s[len] != ' ' && s[len] != '\0' && s[len] != ',' && s[len] != '\n' && s[len] != '\r') return false;
     *p = s + len;
     return true;
 }
 
+// --- Command dispatch ---
 void MMBasic_CmdTurtle(void) {
     char *line = (char*)currentLine;
     while (*line == ' ') line++;
-    if (tMatch(&line, "INIT") || tMatch(&line, "RESET")) {
-        M5Cardputer.Display.fillScreen(0);
-        t.x = 120; t.y = 67; t.heading = 0;
-        t.penDown = 1; t.penColor = 0xFFFF; t.penWidth = 1;
-        t.visible = 0; t.cursorSize = 5; t.cursorColor = 0x07E0;
-        t.fillColor = 0xFFFF; t.fillEnabled = 0;
-        tDrawCursor();
+    if (tMatch(&line, "RESET") || tMatch(&line, "INIT")) {
+        int show = 0;
+        while (*line == ' ') line++;
+        if (*line && *line != '\n' && *line != '\r') {
+            int tt; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &show, &f, &s)) return;
+        }
+        tReset(show != 0);
     } else if (tMatch(&line, "FORWARD") || tMatch(&line, "FD")) {
         int tt, d; float f; char *s;
         if (MMBasic_EvaluateExpression(&line, &tt, &d, &f, &s)) return;
-        tMove((float)d);
+        tForward(f != 0 ? f : (float)d);
     } else if (tMatch(&line, "BACK") || tMatch(&line, "BK") || tMatch(&line, "BACKWARD")) {
         int tt, d; float f; char *s;
         if (MMBasic_EvaluateExpression(&line, &tt, &d, &f, &s)) return;
-        tMove(-(float)d);
+        tForward(f != 0 ? -f : -(float)d);
     } else if (tMatch(&line, "RIGHT") || tMatch(&line, "RT")) {
-        int tt, a = 90; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) ; // optional
-        tEraseCursor();
-        t.heading += (float)a;
-        while (t.heading < 0) t.heading += 360;
-        while (t.heading >= 360) t.heading -= 360;
-        tDrawCursor();
+        int a = 90;
+        while (*line == ' ') line++;
+        if (*line && *line != '\n' && *line != '\r') {
+            int tt; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) return;
+        }
+        if (t.visible) tEraseCursor();
+        t.heading = tNormalizeHeading(t.heading + a);
+        if (t.visible) tDrawCursor();
     } else if (tMatch(&line, "LEFT") || tMatch(&line, "LT")) {
-        int tt, a = 90; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) ;
-        tEraseCursor();
-        t.heading -= (float)a;
-        while (t.heading < 0) t.heading += 360;
-        while (t.heading >= 360) t.heading -= 360;
-        tDrawCursor();
-    } else if (tMatch(&line, "PEN") && (tMatch(&line, "UP") || tMatch(&line, "PU"))) {
-        t.penDown = 0;
-    } else if (tMatch(&line, "PEN") && (tMatch(&line, "DOWN") || tMatch(&line, "PD"))) {
-        t.penDown = 1;
-    } else if (tMatch(&line, "PEN") && (tMatch(&line, "COLOUR") || tMatch(&line, "COLOR") || tMatch(&line, "PC"))) {
-        int tt, c; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &c, &f, &s)) return;
-        t.penColor = (uint16_t)c;
-    } else if (tMatch(&line, "PEN") && (tMatch(&line, "WIDTH") || tMatch(&line, "PW"))) {
-        int tt, w; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &w, &f, &s)) return;
-        if (w < 1) w = 1; if (w > 50) w = 50;
-        t.penWidth = w;
+        int a = 90;
+        while (*line == ' ') line++;
+        if (*line && *line != '\n' && *line != '\r') {
+            int tt; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) return;
+        }
+        if (t.visible) tEraseCursor();
+        t.heading = tNormalizeHeading(t.heading - a);
+        if (t.visible) tDrawCursor();
+    } else if (tMatch(&line, "PEN")) {
+        if (tMatch(&line, "UP") || tMatch(&line, "PU")) {
+            t.penDown = 0;
+        } else if (tMatch(&line, "DOWN") || tMatch(&line, "PD")) {
+            t.penDown = 1;
+        } else if (tMatch(&line, "COLOUR") || tMatch(&line, "COLOR") || tMatch(&line, "PC")) {
+            int tt, c; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &c, &f, &s)) return;
+            t.penColor = (uint16_t)c;
+        } else if (tMatch(&line, "WIDTH") || tMatch(&line, "PW")) {
+            int tt, w; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &w, &f, &s)) return;
+            t.penWidth = (w < 1) ? 1 : (w > 50) ? 50 : w;
+        }
     } else if (tMatch(&line, "HOME")) {
-        tEraseCursor();
-        tLineTo(120, 67);
-        t.heading = 0;
-        tDrawCursor();
-    } else if (tMatch(&line, "SET") && (tMatch(&line, "XY") || tMatch(&line, "MOVE"))) {
-        int tt, nx, ny; float f; char *s;
+        tGoto(T_HRES / 2, T_VRES / 2);
+        if (t.visible) { tEraseCursor(); t.heading = 0; tDrawCursor(); }
+    } else if (tMatch(&line, "SETXY") || tMatch(&line, "MOVE")) {
+        int tt; float f; char *s; int nx, ny;
         if (MMBasic_EvaluateExpression(&line, &tt, &nx, &f, &s)) return;
         while (*line == ' ' || *line == ',') line++;
         if (MMBasic_EvaluateExpression(&line, &tt, &ny, &f, &s)) return;
-        tLineTo((float)nx, (float)ny);
-    } else if (tMatch(&line, "SET") && (tMatch(&line, "HEADING") || tMatch(&line, "SETH"))) {
-        int tt, h; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &h, &f, &s)) return;
-        tEraseCursor();
-        t.heading = (float)h;
-        while (t.heading < 0) t.heading += 360;
-        while (t.heading >= 360) t.heading -= 360;
-        tDrawCursor();
-    } else if (tMatch(&line, "SHOW") || tMatch(&line, "ST")) {
-        t.visible = 1;
-        tDrawCursor();
-    } else if (tMatch(&line, "HIDE") || tMatch(&line, "HT")) {
-        tEraseCursor();
-        t.visible = 0;
-    } else if (tMatch(&line, "CURSOR") && (tMatch(&line, "SIZE") || tMatch(&line, "CS"))) {
-        int tt, sz; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &sz, &f, &s)) return;
-        if (sz < 5) sz = 5; if (sz > 50) sz = 50;
-        tEraseCursor();
-        t.cursorSize = sz;
-        tDrawCursor();
-    } else if (tMatch(&line, "CURSOR") && (tMatch(&line, "COLOUR") || tMatch(&line, "COLOR") || tMatch(&line, "CC"))) {
-        int tt, c; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &c, &f, &s)) return;
-        tEraseCursor();
-        t.cursorColor = (uint16_t)c;
-        tDrawCursor();
-    } else if (tMatch(&line, "CIRCLE")) {
-        int tt, r; float f; char *s;
+        tGoto((float)nx, (float)ny);
+    } else if (tMatch(&line, "SETX")) {
+        int tt, nx; float f; char *s;
+        if (MMBasic_EvaluateExpression(&line, &tt, &nx, &f, &s)) return;
+        tGoto((float)nx, t.y);
+    } else if (tMatch(&line, "SETY")) {
+        int tt, ny; float f; char *s;
+        if (MMBasic_EvaluateExpression(&line, &tt, &ny, &f, &s)) return;
+        tGoto(t.x, (float)ny);
+    } else if (tMatch(&line, "SETHEADING") || tMatch(&line, "SETH")) {
+        int tt; float f; char *s;
+        if (MMBasic_EvaluateExpression(&line, &tt, &tt, &f, &s)) return;
+        if (t.visible) tEraseCursor();
+        t.heading = tNormalizeHeading((float)tt);
+        if (t.visible) tDrawCursor();
+    } else if (tMatch(&line, "SET")) {
+        if (tMatch(&line, "XY")) {
+            int tt; float f; char *s; int nx, ny;
+            if (MMBasic_EvaluateExpression(&line, &tt, &nx, &f, &s)) return;
+            while (*line == ' ' || *line == ',') line++;
+            if (MMBasic_EvaluateExpression(&line, &tt, &ny, &f, &s)) return;
+            tGoto((float)nx, (float)ny);
+        } else if (tMatch(&line, "X")) {
+            int tt, nx; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &nx, &f, &s)) return;
+            tGoto((float)nx, t.y);
+        } else if (tMatch(&line, "Y")) {
+            int tt, ny; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &ny, &f, &s)) return;
+            tGoto(t.x, (float)ny);
+        } else if (tMatch(&line, "HEADING")) {
+            int tt; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &tt, &f, &s)) return;
+            if (t.visible) tEraseCursor();
+            t.heading = tNormalizeHeading((float)tt);
+            if (t.visible) tDrawCursor();
+        }
+    } else if (tMatch(&line, "ARC")) {
+        int tt; float f; char *s; int r, a;
         if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
-        M5Cardputer.Display.drawCircle((int)t.x, (int)t.y, r, t.penColor);
-    } else if (tMatch(&line, "FCIRCLE")) {
-        int tt, r; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
-        M5Cardputer.Display.fillCircle((int)t.x, (int)t.y, r, t.fillEnabled ? t.fillColor : t.penColor);
-    } else if (tMatch(&line, "DOT")) {
-        int tt, sz = 5; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &sz, &f, &s)) ;
-        M5Cardputer.Display.fillCircle((int)t.x, (int)t.y, sz, t.penColor);
-    } else if (tMatch(&line, "FRECT") || tMatch(&line, "FRECTANGLE")) {
-        int tt, w, h; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &w, &f, &s)) return;
         while (*line == ' ' || *line == ',') line++;
-        if (MMBasic_EvaluateExpression(&line, &tt, &h, &f, &s)) return;
-        int fc = t.fillEnabled ? t.fillColor : t.penColor;
-        M5Cardputer.Display.fillRect((int)t.x - w/2, (int)t.y - h/2, w, h, fc);
-    } else if (tMatch(&line, "FILL") && (tMatch(&line, "COLOUR") || tMatch(&line, "COLOR") || tMatch(&line, "FC"))) {
-        int tt, c; float f; char *s;
-        if (MMBasic_EvaluateExpression(&line, &tt, &c, &f, &s)) return;
-        t.fillColor = (uint16_t)c; t.fillEnabled = 1;
-    } else if (tMatch(&line, "NO") && tMatch(&line, "FILL")) {
-        t.fillEnabled = 0;
+        if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) return;
+        tArc((float)r, (float)a);
+    } else if (tMatch(&line, "ARCL") || tMatch(&line, "ARCLEFT") || tMatch(&line, "ARC LEFT")) {
+        int tt; float f; char *s; int r, a;
+        if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
+        while (*line == ' ' || *line == ',') line++;
+        if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) return;
+        tArc((float)r, (float)a);
+    } else if (tMatch(&line, "ARCR") || tMatch(&line, "ARCRIGHT") || tMatch(&line, "ARC RIGHT")) {
+        int tt; float f; char *s; int r, a;
+        if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
+        while (*line == ' ' || *line == ',') line++;
+        if (MMBasic_EvaluateExpression(&line, &tt, &a, &f, &s)) return;
+        tArc((float)r, -(float)a);
     } else if (tMatch(&line, "BEZIER")) {
-        int tt, cp1, a1, cp2, a2, ep, ea; float f; char *s;
+        int tt; float f; char *s; int cp1, a1, cp2, a2, ep, ea;
         if (MMBasic_EvaluateExpression(&line, &tt, &cp1, &f, &s)) return;
         while (*line==' '||*line==',') line++;
         if (MMBasic_EvaluateExpression(&line, &tt, &a1, &f, &s)) return;
@@ -3368,49 +3529,159 @@ void MMBasic_CmdTurtle(void) {
         if (MMBasic_EvaluateExpression(&line, &tt, &ep, &f, &s)) return;
         while (*line==' '||*line==',') line++;
         if (MMBasic_EvaluateExpression(&line, &tt, &ea, &f, &s)) return;
-        tEraseCursor();
-        float h = t.heading;
-        float r1 = h + a1, r2 = h + a1 + a2, re = h + a1 + a2 + ea;
-        float p1x = t.x + cp1 * sin(r1 * 3.14159f / 180.0f);
-        float p1y = t.y - cp1 * cos(r1 * 3.14159f / 180.0f);
-        float p2x = p1x + cp2 * sin(r2 * 3.14159f / 180.0f);
-        float p2y = p1y - cp2 * cos(r2 * 3.14159f / 180.0f);
-        float ex = p2x + ep * sin(re * 3.14159f / 180.0f);
-        float ey = p2y - ep * cos(re * 3.14159f / 180.0f);
+        float h = t.heading, r1 = h+a1, r2 = h+a1+a2, re = h+a1+a2+ea;
+        float p1x = t.x + cp1*sin(r1*3.14159f/180), p1y = t.y - cp1*cos(r1*3.14159f/180);
+        float p2x = p1x + cp2*sin(r2*3.14159f/180), p2y = p1y - cp2*cos(r2*3.14159f/180);
+        float ex = p2x + ep*sin(re*3.14159f/180), ey = p2y - ep*cos(re*3.14159f/180);
         float ox = t.x, oy = t.y;
         for (int seg = 1; seg <= 20; seg++) {
-            float tt = seg / 20.0f;
-            float u = 1.0f - tt;
-            float cx = u*u*u*ox + 3*u*u*tt*p1x + 3*u*tt*tt*p2x + tt*tt*tt*ex;
-            float cy = u*u*u*oy + 3*u*u*tt*p1y + 3*u*tt*tt*p2y + tt*tt*tt*ey;
-            if (t.penDown) M5Cardputer.Display.drawLine((int)t.x, (int)t.y, (int)cx, (int)cy, t.penColor);
+            float tt2 = seg/20.0f, u = 1.0f-tt2;
+            float cx = u*u*u*ox+3*u*u*tt2*p1x+3*u*tt2*tt2*p2x+tt2*tt2*tt2*ex;
+            float cy = u*u*u*oy+3*u*u*tt2*p1y+3*u*tt2*tt2*p2y+tt2*tt2*tt2*ey;
+            if (t.penDown) tDrawLine((int)t.x, (int)t.y, (int)cx, (int)cy, -t.penWidth, t.penColor);
             t.x = cx; t.y = cy;
         }
-        t.heading = re;
-        while (t.heading < 0) t.heading += 360;
-        while (t.heading >= 360) t.heading -= 360;
-        tDrawCursor();
-    } else if (tMatch(&line, "STAMP")) {
+        t.heading = tNormalizeHeading(re);
+        if (t.visible) tDrawCursor();
+    } else if (tMatch(&line, "CIRCLE")) {
+        int tt, r; float f; char *s;
+        if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
+        M5Cardputer.Display.drawCircle((int)t.x, (int)t.y, r, t.penColor);
+    } else if (tMatch(&line, "DOT")) {
+        int sz = 5;
+        while (*line == ' ') line++;
+        if (*line && *line != '\n' && *line != '\r') {
+            int tt; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &sz, &f, &s)) return;
+        }
+        M5Cardputer.Display.fillCircle((int)t.x, (int)t.y, sz, t.penColor);
+    } else if (tMatch(&line, "FCIRCLE")) {
+        int tt, r; float f; char *s;
+        if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
+        if (t.fillEnabled) M5Cardputer.Display.fillCircle((int)t.x, (int)t.y, r, t.fillColor);
+        if (t.penDown) M5Cardputer.Display.drawCircle((int)t.x, (int)t.y, r, t.penColor);
+    } else if (tMatch(&line, "FRECT") || tMatch(&line, "FRECTANGLE")) {
+        int tt; float f; char *s; int w, h;
+        if (MMBasic_EvaluateExpression(&line, &tt, &w, &f, &s)) return;
+        while (*line == ' ' || *line == ',') line++;
+        if (MMBasic_EvaluateExpression(&line, &tt, &h, &f, &s)) return;
+        int x = (int)t.x - w/2, y = (int)t.y - h/2;
+        if (t.fillEnabled) M5Cardputer.Display.fillRect(x, y, w, h, t.fillColor);
+        if (t.penDown) {
+            tDrawLine(x, y, x+w-1, y, 1, t.penColor);
+            tDrawLine(x, y+h-1, x+w-1, y+h-1, 1, t.penColor);
+            tDrawLine(x, y, x, y+h-1, 1, t.penColor);
+            tDrawLine(x+w-1, y, x+w-1, y+h-1, 1, t.penColor);
+        }
+    } else if (tMatch(&line, "ARECT") || tMatch(&line, "ARECTANGLE")) {
+        int tt; float f; char *s; int w, h;
+        if (MMBasic_EvaluateExpression(&line, &tt, &w, &f, &s)) return;
+        while (*line == ' ' || *line == ',') line++;
+        if (MMBasic_EvaluateExpression(&line, &tt, &h, &f, &s)) return;
+        float rad = t.heading * 3.14159f / 180.0f;
+        float rp = (t.heading + 90) * 3.14159f / 180.0f;
+        float dxw = (w/2)*sin(rad), dyw = (w/2)*cos(rad);
+        float dxh = (h/2)*sin(rp), dyh = (h/2)*cos(rp);
         int cx = (int)t.x, cy = (int)t.y;
-        M5Cardputer.Display.fillCircle(cx, cy - 3, 5, 0x07E0);
-        M5Cardputer.Display.fillCircle(cx, cy + 2, 7, 0x07E0);
-        M5Cardputer.Display.fillRect(cx - 3, cy - 8, 6, 4, 0x07E0);
-        M5Cardputer.Display.fillRect(cx - 6, cy - 1, 4, 3, 0x07E0);
-        M5Cardputer.Display.fillRect(cx + 2, cy - 1, 4, 3, 0x07E0);
-        M5Cardputer.Display.fillRect(cx - 5, cy + 6, 3, 3, 0x07E0);
-        M5Cardputer.Display.fillRect(cx + 2, cy + 6, 3, 3, 0x07E0);
+        int px[4], py[4];
+        px[0] = cx-(int)(dxw+dxh); py[0] = cy+(int)(dyw+dyh);
+        px[1] = cx+(int)(dxw-dxh); py[1] = cy-(int)(dyw+dyh);
+        px[2] = cx+(int)(dxw+dxh); py[2] = cy-(int)(dyw-dyh);
+        px[3] = cx-(int)(dxw-dxh); py[3] = cy+(int)(dyw-dyh);
+        if (t.fillEnabled) {
+            tFillScanline(px, py, 4, t.fillColor);
+        }
+        if (t.penDown) {
+            for (int i = 0; i < 4; i++)
+                tDrawLine(px[i], py[i], px[(i+1)%4], py[(i+1)%4], -t.penWidth, t.penColor);
+        }
+    } else if (tMatch(&line, "WEDGE")) {
+        int tt; float f; char *s; int r, sa, ea;
+        if (MMBasic_EvaluateExpression(&line, &tt, &r, &f, &s)) return;
+        while (*line==' '||*line==',') line++;
+        if (MMBasic_EvaluateExpression(&line, &tt, &sa, &f, &s)) return;
+        while (*line==' '||*line==',') line++;
+        if (MMBasic_EvaluateExpression(&line, &tt, &ea, &f, &s)) return;
+        int cx = (int)t.x, cy = (int)t.y;
+        int segs = (int)(fabs((float)(ea-sa)) / 5.0f) + 1;
+        int poly_x[128], poly_y[128]; int pc = 0;
+        poly_x[pc] = cx; poly_y[pc] = cy; pc++;
+        for (int i = 0; i <= segs && pc < 127; i++) {
+            float a = (t.heading + sa + (float)(ea-sa)*i/segs) * 3.14159f/180;
+            poly_x[pc] = cx + (int)(r * cos(a));
+            poly_y[pc] = cy - (int)(r * sin(a));
+            pc++;
+        }
+        if (t.fillEnabled) tFillScanline(poly_x, poly_y, pc, t.fillColor);
+        if (t.penDown) {
+            for (int i = 1; i < pc-1; i++)
+                tDrawLine(poly_x[i], poly_y[i], poly_x[i+1], poly_y[i+1], -t.penWidth, t.penColor);
+            tDrawLine(cx, cy, poly_x[1], poly_y[1], -t.penWidth, t.penColor);
+            tDrawLine(cx, cy, poly_x[pc-1], poly_y[pc-1], -t.penWidth, t.penColor);
+        }
+    } else if (tMatch(&line, "FILL")) {
+        if (tMatch(&line, "COLOUR") || tMatch(&line, "COLOR") || tMatch(&line, "FC")) {
+            int tt, c; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &c, &f, &s)) return;
+            t.fillColor = (uint16_t)c; t.fillEnabled = 1;
+        } else if (tMatch(&line, "PATTERN") || tMatch(&line, "FP")) {
+            int tt, p; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &p, &f, &s)) return;
+            t.fillPattern = (p < 0) ? 0 : (p > 31) ? 31 : p;
+        }
+    } else if (tMatch(&line, "NO") && tMatch(&line, "FILL")) {
+        t.fillEnabled = 0;
+    } else if ((tMatch(&line, "BEGIN") && tMatch(&line, "FILL")) || tMatch(&line, "BF")) {
+        t.polyCount = 0; t.polyRecording = 1;
+        t.polyX[0] = (int)t.x; t.polyY[0] = (int)t.y; t.polyCount = 1;
+    } else if ((tMatch(&line, "END") && tMatch(&line, "FILL")) || tMatch(&line, "EF")) {
+        t.polyRecording = 0;
+        if (t.polyCount > 2) {
+            if (t.visible) tEraseCursor();
+            tDrawFilledPolygon();
+            if (t.visible) tDrawCursor();
+        }
+        t.polyCount = 0;
+    } else if (tMatch(&line, "SHOW") || tMatch(&line, "ST") || tMatch(&line, "SHOWTURTLE")) {
+        t.visible = 1; tDrawCursor();
+    } else if (tMatch(&line, "HIDE") || tMatch(&line, "HT") || tMatch(&line, "HIDETURTLE")) {
+        tEraseCursor(); t.visible = 0;
+    } else if (tMatch(&line, "CURSOR")) {
+        if (tMatch(&line, "SIZE") || tMatch(&line, "CS")) {
+            int tt, sz; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &sz, &f, &s)) return;
+            if (sz < 5) sz = 5; if (sz > 50) sz = 50;
+            if (t.visible) tEraseCursor();
+            t.cursorSize = sz;
+            if (t.visible) tDrawCursor();
+        } else if (tMatch(&line, "COLOUR") || tMatch(&line, "COLOR") || tMatch(&line, "CC")) {
+            int tt, c; float f; char *s;
+            if (MMBasic_EvaluateExpression(&line, &tt, &c, &f, &s)) return;
+            if (t.visible) tEraseCursor();
+            t.cursorColor = (uint16_t)c;
+            if (t.visible) tDrawCursor();
+        }
+    } else if (tMatch(&line, "STAMP")) {
+        // Simplified stamp
+        int cx = (int)t.x, cy = (int)t.y;
+        M5Cardputer.Display.fillCircle(cx, cy-3, 5, 0x07E0);
+        M5Cardputer.Display.fillCircle(cx, cy+2, 7, 0x07E0);
+        M5Cardputer.Display.fillRect(cx-3, cy-8, 6, 4, 0x07E0);
+        M5Cardputer.Display.fillRect(cx-6, cy-1, 4, 3, 0x07E0);
+        M5Cardputer.Display.fillRect(cx+2, cy-1, 4, 3, 0x07E0);
+        M5Cardputer.Display.fillRect(cx-5, cy+6, 3, 3, 0x07E0);
+        M5Cardputer.Display.fillRect(cx+2, cy+6, 3, 3, 0x07E0);
     } else if (tMatch(&line, "PUSH")) {
-        if (tStackPtr < 16) {
-            tStackX[tStackPtr] = t.x; tStackY[tStackPtr] = t.y;
-            tStackH[tStackPtr] = t.heading; tStackPtr++;
+        if (t.stackPtr < 16) {
+            t.stackX[t.stackPtr] = t.x; t.stackY[t.stackPtr] = t.y;
+            t.stackH[t.stackPtr] = t.heading; t.stackPtr++;
         }
     } else if (tMatch(&line, "POP")) {
-        if (tStackPtr > 0) {
-            tStackPtr--;
-            tLineTo(tStackX[tStackPtr], tStackY[tStackPtr]);
-            tEraseCursor();
-            t.heading = tStackH[tStackPtr];
-            tDrawCursor();
+        if (t.stackPtr > 0) {
+            t.stackPtr--;
+            tGoto(t.stackX[t.stackPtr], t.stackY[t.stackPtr]);
+            if (t.visible) { tEraseCursor(); t.heading = t.stackH[t.stackPtr]; tDrawCursor(); }
+            else t.heading = t.stackH[t.stackPtr];
         }
     }
 }
