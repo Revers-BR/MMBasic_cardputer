@@ -1,13 +1,4 @@
-/*
- * MMBasic.h - MMBasic Core Header
- * 
- * This file defines the core structures and functions for MMBasic
- */
 
-#ifndef MMBASIC_H
-#define MMBASIC_H
-
-#include <stdint.h>
 #include <stdbool.h>
 #include <setjmp.h>
 #include "MMBasic_Config.h"
@@ -110,6 +101,19 @@
 #define C_TURTLE    0xD7
 #define C_SPRITE    0xD8
 #define C_VAR       0xD9
+#define C_CHAIN     0xDA
+#define C_MERGE     0xDB
+#define C_EXECUTE   0xDC
+#define C_DELETE    0xDD
+#define C_FLUSH     0xDE
+#define C_BACKLIGHT 0xDF
+#define C_TIMER_CMD 0xE0
+#define C_SETTICK   0xE1
+#define C_WATCHDOG  0xE2
+#define C_CPU       0xE3
+#define C_MEMORY    0xE4
+#define C_LOCAL     0xE5
+#define C_STATIC    0xE6
 
 // Function tokens (values are unique IDs, dispatched via C_FUNC type in table)
 #define F_ABS       0x01
@@ -170,6 +174,28 @@
 #define F_FIX       0x38
 #define F_CHOICE    0x39
 #define F_BOUND     0x3A
+#define F_INKEY     0x3B
+#define F_KEYDOWN   0x3C
+#define F_VERSION   0x3D
+#define F_TIMER     0x3E
+#define F_MM_HRES   0x3F
+#define F_MM_VRES   0x40
+#define F_MM_WIDTH  0x41
+#define F_MM_HEIGHT 0x42
+#define F_MM_HPOS   0x43
+#define F_MM_VPOS   0x44
+#define F_MM_DEVICE 0x45
+#define F_MM_FONTWIDTH  0x46
+#define F_MM_FONTHEIGHT 0x47
+#define F_MM_ERRNO  0x48
+#define F_MM_ERRMSG 0x49
+#define F_MM_FLAGS  0x4A
+#define F_MM_DISPLAY 0x4B
+#define F_MM_SUPPLY 0x4C
+#define F_MM_INFO   0x4D
+#define F_CWD       0x4E
+#define F_DIR       0x4F
+#define F_FIELD     0x50
 
 // Operator tokens (used internally in expression evaluator, not in token table)
 #define OP_PLUS      0x01
@@ -218,6 +244,9 @@
 #define ERR_BOUNDS      15
 #define ERR_INVALID     16
 
+// Maximum number of array dimensions
+#define MAXDIMS 4
+
 // Variable structure
 struct s_vartbl {
     char name[MAXVARLEN + 1];   // Variable name
@@ -227,7 +256,8 @@ struct s_vartbl {
         float fval;             // Float value
         char *sval;             // String value
     } val;
-    int array;                  // Array dimensions (0 = not array)
+    int ndims;                  // Number of dimensions (0 = not array, 1-4 = dimensions)
+    int dims[MAXDIMS];          // Dimension sizes (upper bounds)
     int *arr;                   // Array data pointer
 };
 
@@ -261,6 +291,9 @@ extern jmp_buf mark;            // Error recovery jump buffer
 extern int MMCharPos;           // Character position
 extern volatile int MMAbort;    // Abort flag
 extern char BreakKey;           // Break key
+extern int onErrorSkipCount;    // ON ERROR SKIP: lines to skip
+extern int onErrorSkipActive;   // ON ERROR SKIP: active skip count
+extern int MMBasic_ForSingleLine; // Set when line has FOR...NEXT on same line
 
 // Core functions
 void MMBasic_Init(void);
@@ -285,6 +318,7 @@ int MMBasic_GetOperator(char *token);
 void MMBasic_ClearVariables(void);
 int MMBasic_FindVariable(char *name);
 int MMBasic_CreateVariable(char *name, char type);
+char MMBasic_GetVarType(char *name);
 void MMBasic_SetVariable(int index, int ival, float fval, char *sval);
 int MMBasic_GetVariableInt(int index);
 float MMBasic_GetVariableFloat(int index);
@@ -375,6 +409,8 @@ void MMBasic_CmdVar(void);
 void MMBasic_CmdSubFunDef(void);
 void MMBasic_CmdEndSubFun(void);
 void MMBasic_CmdOn(void);
+void MMBasic_CmdLocal(void);
+void MMBasic_CmdStatic(void);
 
 // File I/O functions
 int MMBasic_FuncEOF(int fnbr);
@@ -418,5 +454,41 @@ char *MMBasic_FuncTrim(char *str);
 char *MMBasic_FuncHex(int val);
 char *MMBasic_FuncOct(int val);
 char *MMBasic_FuncBin(int val);
+
+// New command implementations
+void MMBasic_CmdChain(void);
+void MMBasic_CmdMerge(void);
+void MMBasic_CmdExecute(void);
+void MMBasic_CmdDelete(void);
+void MMBasic_CmdFlush(void);
+void MMBasic_CmdBacklight(void);
+void MMBasic_CmdTimerCmd(void);
+void MMBasic_CmdSettick(void);
+void MMBasic_CmdWatchdog(void);
+void MMBasic_CmdCpu(void);
+void MMBasic_CmdMemory(void);
+
+// New function implementations
+char *MMBasic_FuncInkey(void);
+int MMBasic_FuncKeydown(int key);
+char *MMBasic_FuncVersion(void);
+int MMBasic_FuncTimer(void);
+int MMBasic_FuncMMHres(void);
+int MMBasic_FuncMMVres(void);
+int MMBasic_FuncMMWidth(void);
+int MMBasic_FuncMMHeight(void);
+int MMBasic_FuncMMHpos(void);
+int MMBasic_FuncMMVpos(void);
+char *MMBasic_FuncMMDevice(void);
+int MMBasic_FuncMMFontwidth(void);
+int MMBasic_FuncMMFontheight(void);
+int MMBasic_FuncMMErrno(void);
+char *MMBasic_FuncMMErrmsg(void);
+int MMBasic_FuncMMFlags(void);
+int MMBasic_FuncMMDisplay(void);
+float MMBasic_FuncMMSupply(void);
+char *MMBasic_FuncCwd(void);
+char *MMBasic_FuncDir(char *fspec, int type);
+char *MMBasic_FuncField(char *str, int n, char *delim);
 
 #endif // MMBASIC_H
