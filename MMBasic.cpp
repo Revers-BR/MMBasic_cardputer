@@ -19,7 +19,7 @@ static int EvaluateSubExpression(char **expr, int *itype, int *ival, float *fval
 static int EvaluateTerm(char **expr, int *itype, int *ival, float *fval, char **sval);
 static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char **sval);
 static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, float *fval, char **sval);
-void ScanSubFunDefs(void);
+static void MMBasic_ExecuteDispatch(char *line);
 
 // Global variables
 char *progmem = NULL;           // Program memory
@@ -41,6 +41,7 @@ char *currentLine = NULL;
 int currentLineIndex = -1;
 bool flowControlActive = false; // Set true when a command changes line flow
 bool traceOn = false;            // TRACE ON/OFF
+int MMBasic_ForSingleLine = 0;  // Set true when line has FOR...NEXT on same line
 
 // FOR loop stack
 struct s_forstack {
@@ -68,42 +69,14 @@ int dostackptr = 0;
 // SELECT CASE stack
 struct s_select {
     int matchValue;
+    char matchStr[STRINGSIZE];  // For string SELECT CASE
+    char matchType;             // T_INT or T_STR
     bool matched;
 };
 s_select selectstack[8];
 int selectptr = 0;
 
-// SUB/FUNCTION registry
-struct s_subfun_entry {
-    char name[MAXVARLEN+1];
-    int startLine;      // Index in lines[] of SUB/FUNCTION definition
-    int endLine;        // Index in lines[] of END SUB/END FUNCTION
-    int paramCount;
-    char paramNames[8][MAXVARLEN+1];
-    bool isFunction;
-    int returnLine;     // Return address for CALL (saved from GOSUB stack)
-};
-s_subfun_entry subFunTable[MAXSUBFUN];
-int subFunCount = 0;
-int subFunCallReturnIdx = -1;  // Return line index from CALL
-
-// Variable shadow stack for parameter scoping
-struct s_shadow {
-    int varIndex;
-    char type;
-    int ival;
-    float fval;
-    char *sval;
-    int array;
-    int *arr;
-    bool wasConst;
-};
-#define MAX_SHADOW 128
-s_shadow shadowStack[MAX_SHADOW];
-int shadowPtr = 0;
-int shadowBase[16];      // Shadow pointer at SUB entry
-int shadowBaseSP = 0;
-int subFunRetStack[16];    // Return address per SUB level
+// Program line storage
 #define MAX_LINES 1000
 char *lines[MAX_LINES];
 int lineNumbers[MAX_LINES];
@@ -133,8 +106,57 @@ int dataOffset = 0;
 // CONST tracking
 bool *varIsConst = NULL;
 
+// Sub/Fun table for SUB/FUNCTION support
+struct s_subfun_entry {
+    char name[33];
+    int startLine, endLine, paramCount;
+    char paramNames[8][33];
+    bool isFunction;
+    int returnLine;
+};
+s_subfun_entry subFunTable[128];
+int subFunCount = 0;
+int subFunCallReturnIdx = -1;
+
+// Shadow stack for LOCAL variable support
+struct s_shadow {
+    int varIndex;
+    char type;
+    int ival;
+    float fval;
+    char *sval;
+    int ndims;
+    int dims[MAXDIMS];
+    int *arr;
+    bool wasConst;
+    bool isStatic;
+};
+s_shadow shadowStack[128];
+int shadowPtr = 0;
+int shadowBase[16];
+int shadowBaseSP = 0;
+int subFunRetStack[16];
+
+// Static variable storage and SUB tracking for LOCAL/STATIC support
+struct s_static_var {
+    char name[MAXVARLEN+1];
+    int subfunIndex;
+    char type;
+    int ival;
+    float fval;
+    char sval[STRINGSIZE];
+    int ndims;
+    int dims[MAXDIMS];
+    int *arr;
+};
+s_static_var staticVars[64];
+int staticVarCount = 0;
+int currentSubFunIdx = -1;
+int subFunIdxStack[16];
+int subFunIdxSP = 0;
+
 // Token table
-const struct s_tokentbl commandtbl[] = {
+static const struct s_tokentbl commandtbl[] = {
     {"PRINT", C_CMD, C_PRINT, NULL},
     {"INPUT", C_CMD, C_INPUT, NULL},
     {"IF", C_CMD, C_IF, NULL},
@@ -147,7 +169,6 @@ const struct s_tokentbl commandtbl[] = {
     {"NEXT", C_CMD, C_NEXT, NULL},
     {"GOTO", C_CMD, C_GOTO, NULL},
     {"GOSUB", C_CMD, C_GOSUB, NULL},
-    {"ON", C_CMD, C_ON, NULL},
     {"RETURN", C_CMD, C_RETURN, NULL},
     {"END", C_CMD, C_END, NULL},
     {"LET", C_CMD, C_LET, NULL},
@@ -214,14 +235,10 @@ const struct s_tokentbl commandtbl[] = {
     {"ERROR", C_CMD, C_ERROR, NULL},
     {"TRACE", C_CMD, C_TRACE, NULL},
     {"SORT", C_CMD, C_SORTCMD, NULL},
-    {"CALL", C_CMD, C_CALL, NULL},
-    {"TURTLE", C_CMD, C_TURTLE, NULL},
-    {"SPRITE", C_CMD, C_SPRITE, NULL},
-    {"VAR", C_CMD, C_VAR, NULL},
+    {"ON", C_CMD, C_ON, NULL},
     {"SUB", C_CMD, C_SUB, NULL},
-    {"ENDSUB", C_CMD, C_ENDSUB, NULL},
     {"FUNCTION", C_CMD, C_FUNCTION, NULL},
-    {"ENDFUNCTION", C_CMD, C_ENDFUN, NULL},
+    {"CALL", C_CMD, C_CALL, NULL},
     {"ABS", C_FUNC, F_ABS, NULL},
     {"INT", C_FUNC, F_INT, NULL},
     {"SGN", C_FUNC, F_SGN, NULL},
@@ -280,6 +297,41 @@ const struct s_tokentbl commandtbl[] = {
     {"FIX", C_FUNC, F_FIX, NULL},
     {"CHOICE", C_FUNC, F_CHOICE, NULL},
     {"BOUND", C_FUNC, F_BOUND, NULL},
+    // New commands
+    {"CHAIN", C_CMD, C_CHAIN, NULL},
+    {"MERGE", C_CMD, C_MERGE, NULL},
+    {"EXECUTE", C_CMD, C_EXECUTE, NULL},
+    {"DELETE", C_CMD, C_DELETE, NULL},
+    {"FLUSH", C_CMD, C_FLUSH, NULL},
+    {"BACKLIGHT", C_CMD, C_BACKLIGHT, NULL},
+    {"SETTICK", C_CMD, C_SETTICK, NULL},
+    {"WATCHDOG", C_CMD, C_WATCHDOG, NULL},
+    {"CPU", C_CMD, C_CPU, NULL},
+    {"MEMORY", C_CMD, C_MEMORY, NULL},
+    {"LOCAL", C_CMD, C_LOCAL, NULL},
+    {"STATIC", C_CMD, C_STATIC, NULL},
+    // New functions
+    {"INKEY$", C_FUNC, F_INKEY, NULL},
+    {"KEYDOWN", C_FUNC, F_KEYDOWN, NULL},
+    {"VERSION", C_FUNC, F_VERSION, NULL},
+    {"MM.HRES", C_FUNC, F_MM_HRES, NULL},
+    {"MM.VRES", C_FUNC, F_MM_VRES, NULL},
+    {"MM.WIDTH", C_FUNC, F_MM_WIDTH, NULL},
+    {"MM.HEIGHT", C_FUNC, F_MM_HEIGHT, NULL},
+    {"MM.HPOS", C_FUNC, F_MM_HPOS, NULL},
+    {"MM.VPOS", C_FUNC, F_MM_VPOS, NULL},
+    {"MM.DEVICE$", C_FUNC, F_MM_DEVICE, NULL},
+    {"MM.FONTWIDTH", C_FUNC, F_MM_FONTWIDTH, NULL},
+    {"MM.FONTHEIGHT", C_FUNC, F_MM_FONTHEIGHT, NULL},
+    {"MM.ERRNO", C_FUNC, F_MM_ERRNO, NULL},
+    {"MM.ERRMSG$", C_FUNC, F_MM_ERRMSG, NULL},
+    {"MM.FLAGS", C_FUNC, F_MM_FLAGS, NULL},
+    {"MM.DISPLAY", C_FUNC, F_MM_DISPLAY, NULL},
+    {"MM.SUPPLY", C_FUNC, F_MM_SUPPLY, NULL},
+    {"MM.INFO", C_FUNC, F_MM_INFO, NULL},
+    {"CWD$", C_FUNC, F_CWD, NULL},
+    {"DIR$", C_FUNC, F_DIR, NULL},
+    {"FIELD$", C_FUNC, F_FIELD, NULL},
     {"", 0, 0, NULL}
 };
 
@@ -357,6 +409,17 @@ void MMBasic_Reset(void) {
     memset(lineNumbers, 0, sizeof(lineNumbers));
 }
 
+// Get variable type from name suffix
+// $ = string, % = integer, ! = float, no suffix = integer
+char MMBasic_GetVarType(char *name) {
+    int len = strlen(name);
+    if (len == 0) return T_INT;
+    if (name[len - 1] == '$') return T_STR;
+    if (name[len - 1] == '!') return T_FLOAT;
+    if (name[len - 1] == '%') return T_INT;
+    return T_INT;
+}
+
 // Get next token from line
 char *MMBasic_GetToken(char *line, char *token) {
     int i = 0;
@@ -391,7 +454,7 @@ char *MMBasic_GetToken(char *line, char *token) {
     }
     
     // Check for operator
-    if (strchr("+-*/=<>^&|~(),;#\\", *line)) {
+    if (strchr("+-*/=<>^&|~(),;#", *line)) {
         token[0] = *line++;
         token[1] = '\0';
         
@@ -399,9 +462,7 @@ char *MMBasic_GetToken(char *line, char *token) {
         if (*line != '\0') {
             if ((token[0] == '<' && *line == '=') || 
                 (token[0] == '>' && *line == '=') ||
-                (token[0] == '<' && *line == '>') ||
-                (token[0] == '<' && *line == '<') ||
-                (token[0] == '>' && *line == '>')) {
+                (token[0] == '<' && *line == '>')) {
                 token[1] = *line++;
                 token[2] = '\0';
             }
@@ -410,9 +471,10 @@ char *MMBasic_GetToken(char *line, char *token) {
         return line;
     }
     
-    // Check for variable or keyword (including $ for string variables)
+    // Check for variable or keyword (including $/%/! for type suffixes)
     while ((*line >= 'A' && *line <= 'Z') || (*line >= 'a' && *line <= 'z') || 
-           (*line >= '0' && *line <= '9') || *line == '_' || *line == '$') {
+           (*line >= '0' && *line <= '9') || *line == '_' || *line == '$' ||
+           *line == '%' || *line == '!') {
         if (i < STRINGSIZE - 1) token[i++] = *line++;
     }
     token[i] = '\0';
@@ -588,58 +650,8 @@ int MMBasic_Tokenise(char *source, char *dest) {
     return len;
 }
 
-// Store a program line
-void MMBasic_StoreLine(int linenum, char *line) {
-    // Find insertion point
-    int i;
-    for (i = 0; i < linecnt; i++) {
-        if (lineNumbers[i] == linenum) {
-            // Replace existing line
-            // For now, just mark as deleted if empty
-            if (line[0] == '\0') {
-                // Shift lines up
-                for (int j = i; j < linecnt - 1; j++) {
-                    lines[j] = lines[j + 1];
-                    lineNumbers[j] = lineNumbers[j + 1];
-                }
-                linecnt--;
-                return;
-            }
-            // Replace line content
-            lines[i] = progptr;
-            strcpy(progptr, line);
-            progptr += strlen(line) + 1;
-            return;
-        }
-        if (lineNumbers[i] > linenum) {
-            break;
-        }
-    }
-    
-    // Insert new line
-    if (line[0] == '\0') return; // Don't insert empty lines
-    
-    if (linecnt >= MAX_LINES) {
-        MMBasic_Error(ERR_OUT_MEMORY, "Program too large");
-        return;
-    }
-    
-    // Shift lines down
-    for (int j = linecnt; j > i; j--) {
-        lines[j] = lines[j - 1];
-        lineNumbers[j] = lineNumbers[j - 1];
-    }
-    
-    // Store new line
-    lines[i] = progptr;
-    lineNumbers[i] = linenum;
-    strcpy(progptr, line);
-    progptr += strlen(line) + 1;
-    linecnt++;
-}
-
-// Execute a line
-void MMBasic_Execute(char *line) {
+// Execute a single statement (no colon splitting)
+static void MMBasic_ExecuteDispatch(char *line) {
     char token[STRINGSIZE];
     int cmd;
     
@@ -648,56 +660,13 @@ void MMBasic_Execute(char *line) {
     // Skip whitespace
     while (*line == ' ' || *line == '\t') line++;
     
-    // Check for empty line
+    // Check for empty sub-statement
     if (*line == '\0') return;
-    
-    // Handle : (colon) statement separator
-    {
-        char *scan = line;
-        char *colonPos = NULL;
-        while (*scan) {
-            if (*scan == '"') {
-                scan++;
-                while (*scan && *scan != '"') scan++;
-                if (*scan == '"') scan++;
-            } else if (*scan == '\'') {
-                break; // comment - stop scanning
-            } else if ((*scan == 'R' || *scan == 'r') &&
-                       (scan[1] == 'E' || scan[1] == 'e') &&
-                       (scan[2] == 'M' || scan[2] == 'm') &&
-                       (scan == line || *(scan-1) == ' ' || *(scan-1) == '\t')) {
-                break; // REM comment - stop scanning
-            } else if (*scan == ':') {
-                colonPos = scan;
-                break;
-            } else {
-                scan++;
-            }
-        }
-        if (colonPos) {
-            char saved = *colonPos;
-            *colonPos = '\0';
-            MMBasic_Execute(line);
-            *colonPos = saved;
-            if (!flowControlActive) {
-                MMBasic_Execute(colonPos + 1);
-            }
-            return;
-        }
-    }
     
     // Get command token
     char *nextPos = MMBasic_GetToken(line, token);
     
     if (token[0] == '\0') return;
-    
-    // Check for line number (program storage)
-    if (token[0] >= '0' && token[0] <= '9') {
-        int linenum = atoi(token);
-        // Store the rest of the line
-        MMBasic_StoreLine(linenum, nextPos);
-        return;
-    }
     
     // Find command
     cmd = MMBasic_GetCommand(token);
@@ -733,9 +702,6 @@ void MMBasic_Execute(char *line) {
         case C_GOSUB:
             MMBasic_CmdGosub();
             break;
-        case C_ON:
-            MMBasic_CmdOn();
-            break;
         case C_RETURN:
             MMBasic_CmdReturn();
             break;
@@ -747,6 +713,10 @@ void MMBasic_Execute(char *line) {
             break;
         case C_DIM:
             MMBasic_CmdDim();
+            break;
+        case C_SUB:
+        case C_FUNCTION:
+            MMBasic_CmdSubFunDef();
             break;
         case C_CLS:
             HAL_Display_Clear();
@@ -936,22 +906,44 @@ void MMBasic_Execute(char *line) {
         case C_CALL:
             MMBasic_CmdCall();
             break;
-        case C_TURTLE:
-            MMBasic_CmdTurtle();
+        case C_ON:
+            MMBasic_CmdOn();
             break;
-        case C_SPRITE:
-            MMBasic_CmdSprite();
+        case C_CHAIN:
+            MMBasic_CmdChain();
             break;
-        case C_VAR:
-            MMBasic_CmdVar();
+        case C_MERGE:
+            MMBasic_CmdMerge();
             break;
-        case C_SUB:
-        case C_FUNCTION:
-            MMBasic_CmdSubFunDef();
+        case C_EXECUTE:
+            MMBasic_CmdExecute();
             break;
-        case C_ENDSUB:
-        case C_ENDFUN:
-            MMBasic_CmdEndSubFun();
+        case C_DELETE:
+            MMBasic_CmdDelete();
+            break;
+        case C_FLUSH:
+            MMBasic_CmdFlush();
+            break;
+        case C_BACKLIGHT:
+            MMBasic_CmdBacklight();
+            break;
+        case C_SETTICK:
+            MMBasic_CmdSettick();
+            break;
+        case C_WATCHDOG:
+            MMBasic_CmdWatchdog();
+            break;
+        case C_CPU:
+            MMBasic_CmdCpu();
+            break;
+        case C_MEMORY:
+            MMBasic_CmdMemory();
+            break;
+        case C_LOCAL:
+            MMBasic_CmdLocal();
+            break;
+        case C_STATIC:
+            MMBasic_CmdStatic();
             break;
         case C_PRINT_HASH:
         case C_INPUT_HASH:
@@ -964,6 +956,108 @@ void MMBasic_Execute(char *line) {
         default:
             HAL_Display_Println("Command not implemented");
             break;
+    }
+}
+
+// Execute a line (handles colon-separated statements)
+void MMBasic_Execute(char *line) {
+    char token[STRINGSIZE];
+    
+    currentLine = line;
+    
+    // Skip whitespace
+    while (*line == ' ' || *line == '\t') line++;
+    
+    // Check for empty line
+    if (*line == '\0') return;
+    
+    // Get command token
+    char *nextPos = MMBasic_GetToken(line, token);
+    
+    if (token[0] == '\0') return;
+    
+    // Check for line number (program storage)
+    if (token[0] >= '0' && token[0] <= '9') {
+        int linenum = atoi(token);
+        MMBasic_StoreLine(linenum, nextPos);
+        return;
+    }
+    
+    // ----- Colon-splitting: split line by ':' into sub-statements -----
+    #define MAX_SUBSTMTS 32
+    char lineCopy[STRINGSIZE];
+    strncpy(lineCopy, line, STRINGSIZE - 1);
+    lineCopy[STRINGSIZE - 1] = '\0';
+    
+    char *stmts[MAX_SUBSTMTS];
+    int stmtCount = 0;
+    char *p = lineCopy;
+    int inString = 0;
+    int foundComment = 0;
+    
+    while (*p && stmtCount < MAX_SUBSTMTS && !foundComment) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+        
+        char *start = p;
+        while (*p) {
+            if (*p == '"') inString = !inString;
+            if (*p == '\'' && !inString) {
+                foundComment = 1;
+                *p = '\0';
+                break;
+            }
+            if (*p == ':' && !inString) break;
+            p++;
+        }
+        
+        int hasColon = (!foundComment && *p == ':');
+        *p = '\0';
+        
+        // Trim trailing whitespace
+        char *t = p - 1;
+        while (t >= start && (*t == ' ' || *t == '\t')) { *t = '\0'; t--; }
+        
+        stmts[stmtCount++] = start;
+        
+        if (foundComment || !hasColon) break;
+        p++;
+    }
+    
+    // Detect single-line FOR (NEXT on same line)
+    MMBasic_ForSingleLine = 0;
+    if (stmtCount > 1) {
+        char ftok[STRINGSIZE];
+        char *fp = stmts[0];
+        MMBasic_GetToken(fp, ftok);
+        if ((ftok[0]=='F'||ftok[0]=='f') && (ftok[1]=='O'||ftok[1]=='o') &&
+            (ftok[2]=='R'||ftok[2]=='r')) {
+            for (int si = 1; si < stmtCount; si++) {
+                char nt[STRINGSIZE];
+                char *np = stmts[si];
+                MMBasic_GetToken(np, nt);
+                if ((nt[0]=='N'||nt[0]=='n') && (nt[1]=='E'||nt[1]=='e') &&
+                    (nt[2]=='X'||nt[2]=='x') && (nt[3]=='T'||nt[3]=='t')) {
+                    MMBasic_ForSingleLine = 1;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Execute each sub-statement in sequence
+    for (int si = 0; si < stmtCount; si++) {
+        // If sub-statement is REM or ', skip rest of line
+        char subTok[STRINGSIZE];
+        MMBasic_GetToken(stmts[si], subTok);
+        if (strcmp(subTok, "REM") == 0 || (subTok[0] == '\'' && subTok[1] == '\0')) {
+            break;
+        }
+        
+        MMBasic_ExecuteDispatch(stmts[si]);
+        
+        // If flow was redirected (GOTO, loop back, etc.), stop processing
+        if (flowControlActive) break;
     }
 }
 
@@ -991,8 +1085,19 @@ int MMBasic_GetFunction(char *token) {
     return C_INVALID;
 }
 
+// ON ERROR SKIP support
+int onErrorSkipCount = 0;
+int onErrorSkipActive = 0;  // Set to 1 when a skip is triggered
+
 // Error handling
 void MMBasic_Error(int error, char *msg) {
+    // Check if ON ERROR SKIP is active
+    if (onErrorSkipCount > 0) {
+        onErrorSkipActive = onErrorSkipCount;
+        onErrorSkipCount = 0;  // One-shot: clear after firing
+        longjmp(mark, 2);      // Signal "skip" to run loop
+    }
+
     HAL_Display_Print("?Error: ");
     if (msg != NULL) {
         HAL_Display_Println(msg);
@@ -1254,7 +1359,8 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
         char name[MAXVARLEN + 2]; // +2 for $ and null
         int i = 0;
         while ((**expr >= 'A' && **expr <= 'Z') || (**expr >= 'a' && **expr <= 'z') || 
-               (**expr >= '0' && **expr <= '9') || **expr == '_' || **expr == '$') {
+               (**expr >= '0' && **expr <= '9') || **expr == '_' || **expr == '$' ||
+               **expr == '%' || **expr == '!') {
             if (i < MAXVARLEN + 1) name[i++] = **expr;
             (*expr)++;
         }
@@ -1267,127 +1373,77 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
             }
         }
         
-        // Check if it's a built-in function
+        // Check if it's a function
         int funcToken = MMBasic_GetFunction(name);
         if (funcToken != C_INVALID) {
             if (EvaluateFunction(expr, funcToken, &leftType, &leftIval, &leftFval, &leftSval)) return 1;
+            // Don't return - continue to operator handling below
         } else {
-            // Check if it's a user-defined FUNCTION
-            int ufIdx = -1;
-            for (int k=0; k<subFunCount; k++) {
-                if (subFunTable[k].isFunction && strcmp(name, subFunTable[k].name)==0) {
-                    ufIdx = k; break;
-                }
-            }
-            if (ufIdx >= 0) {
-                // Call user FUNCTION - parse arguments in parens
-                if (**expr == '(') (*expr)++;
-                int args[8]; float fargs[8]; char *sargs[8]; int atypes[8]; int argc=0;
-                while (**expr && **expr!=')' && argc<8) {
-                    while (**expr==' '||**expr==','||**expr=='\t') (*expr)++;
-                    if (**expr==')') break;
-                    atypes[argc]=T_INT;
-                    if (EvaluateExpression(expr,&atypes[argc],&args[argc],&fargs[argc],&sargs[argc])) return 1;
-                    argc++;
-                }
-                if (**expr==')') (*expr)++;
-                // Call the function
-                int savedShadowBase = shadowPtr;
-                if (shadowBaseSP<16) shadowBase[shadowBaseSP++]=shadowPtr;
-                for (int p=0; p<subFunTable[ufIdx].paramCount; p++) {
-                    char *pn = subFunTable[ufIdx].paramNames[p];
-                    int vi = MMBasic_FindVariable(pn);
-                    if (shadowPtr>=MAX_SHADOW) break;
-                    if (vi>=0) {
-                        shadowStack[shadowPtr].varIndex=vi; shadowStack[shadowPtr].type=vartbl[vi].type;
-                        shadowStack[shadowPtr].ival=vartbl[vi].val.ival;
-                        shadowStack[shadowPtr].fval=vartbl[vi].val.fval;
-                        shadowStack[shadowPtr].sval=NULL;
-                        if (vartbl[vi].type==T_STR && vartbl[vi].val.sval) {
-                            shadowStack[shadowPtr].sval=(char*)malloc(STRINGSIZE);
-                            strcpy(shadowStack[shadowPtr].sval, vartbl[vi].val.sval);
-                        }
-                        shadowStack[shadowPtr].array=vartbl[vi].array;
-                        shadowStack[shadowPtr].arr=vartbl[vi].arr;
-                        shadowStack[shadowPtr].wasConst=varIsConst[vi];
-                    } else {
-                        shadowStack[shadowPtr].varIndex=-1;
-                        vi = MMBasic_CreateVariable(pn, (p<argc && atypes[p]==T_STR)?T_STR:T_INT);
-                    }
-                    shadowPtr++;
-                    if (vi>=0 && p<argc) {
-                        varIsConst[vi]=false;
-                        if (atypes[p]==T_STR) {
-                            if (!vartbl[vi].val.sval) vartbl[vi].val.sval=(char*)malloc(STRINGSIZE);
-                            strncpy(vartbl[vi].val.sval, sargs[p]?sargs[p]:"",STRINGSIZE-1);
-                            vartbl[vi].type=T_STR;
-                        } else {
-                            vartbl[vi].val.ival=args[p]; vartbl[vi].type=atypes[p];
-                        }
-                    }
-                }
-                // Execute function body
-                int savedIdx = currentLineIndex; char *savedLine = currentLine; int savedFlow = flowControlActive;
-                int savedSCRI = subFunCallReturnIdx;
-                currentLineIndex = subFunTable[ufIdx].startLine + 1;
-                flowControlActive = false;
-                char originalName[MAXVARLEN+1]; strcpy(originalName, name);
-                subFunCallReturnIdx = -1;
-                while (currentLineIndex >= 0 && currentLineIndex < linecnt && 
-                       currentLineIndex <= subFunTable[ufIdx].endLine) {
-                    currentLine = lines[currentLineIndex];
-                    flowControlActive = false;
-                    if (setjmp(mark)==0) { MMBasic_Execute(currentLine); }
-                    else {
-                        // Restore and rethrow
-                        shadowBaseSP--; shadowPtr = savedShadowBase;
-                        longjmp(mark, 1);
-                    }
-                    if (!flowControlActive) currentLineIndex++;
-                }
-                // Restore state
-                currentLineIndex = savedIdx; currentLine = savedLine;
-                flowControlActive = savedFlow;
-                subFunCallReturnIdx = savedSCRI;
-                // Get return value from variable with function name
-                int rvi = MMBasic_FindVariable(originalName);
-                leftType = (rvi>=0) ? vartbl[rvi].type : T_INT;
-                leftIval = (rvi>=0) ? vartbl[rvi].val.ival : 0;
-                leftFval = (rvi>=0) ? vartbl[rvi].val.fval : 0.0f;
-                leftSval = (rvi>=0 && vartbl[rvi].type==T_STR) ? vartbl[rvi].val.sval : NULL;
-                // Cleanup shadows
-                shadowBaseSP--;
-                while (shadowPtr > savedShadowBase) {
-                    shadowPtr--;
-                    int vi2 = shadowStack[shadowPtr].varIndex;
-                    if (vi2>=0) {
-                        if (vartbl[vi2].type==T_STR && vartbl[vi2].val.sval) {
-                            free(vartbl[vi2].val.sval); vartbl[vi2].val.sval=NULL;
-                        }
-                        vartbl[vi2].type=shadowStack[shadowPtr].type;
-                        vartbl[vi2].val.ival=shadowStack[shadowPtr].ival;
-                        vartbl[vi2].val.fval=shadowStack[shadowPtr].fval;
-                        vartbl[vi2].array=shadowStack[shadowPtr].array;
-                        vartbl[vi2].arr=shadowStack[shadowPtr].arr;
-                        varIsConst[vi2]=shadowStack[shadowPtr].wasConst;
-                        if (shadowStack[shadowPtr].sval) vartbl[vi2].val.sval=shadowStack[shadowPtr].sval;
-                    }
-                }
-                // Don't return from EvaluateFactor - continue to operator handling
-            } else {
             // It's a variable
             int varIdx = MMBasic_FindVariable(name);
             if (varIdx < 0) {
-                char type = T_INT;
-                if (name[strlen(name) - 1] == '$') type = T_STR;
+                char type = MMBasic_GetVarType(name);
                 varIdx = MMBasic_CreateVariable(name, type);
                 if (varIdx < 0) return 1;
             }
-            
-            leftType = vartbl[varIdx].type;
-            leftIval = vartbl[varIdx].val.ival;
-            leftFval = vartbl[varIdx].val.fval;
-            leftSval = vartbl[varIdx].val.sval;
+
+            // Check for array access: variable(indices)
+            while (**expr == ' ') (*expr)++;
+            if (vartbl[varIdx].ndims > 0 && **expr == '(') {
+                (*expr)++; // skip '('
+                int indices[MAXDIMS] = {0};
+                int nIdx = 0;
+                while (nIdx < MAXDIMS) {
+                    int idxType, idxIval;
+                    float idxFval;
+                    char *idxSval;
+                    if (EvaluateExpression(expr, &idxType, &idxIval, &idxFval, &idxSval)) return 1;
+                    indices[nIdx++] = idxIval;
+                    while (**expr == ' ') (*expr)++;
+                    if (**expr == ',') { (*expr)++; while (**expr == ' ') (*expr)++; }
+                    else break;
+                }
+                while (**expr == ' ') (*expr)++;
+                if (**expr == ')') (*expr)++;
+                else { MMBasic_Error(ERR_SYNTAX, "Expected )"); return 1; }
+
+                // Calculate flat index
+                int flatIdx = 0;
+                for (int d = 0; d < nIdx; d++) {
+                    int stride = 1;
+                    for (int s = d + 1; s < vartbl[varIdx].ndims; s++) {
+                        stride *= (vartbl[varIdx].dims[s] + 1);
+                    }
+                    flatIdx += indices[d] * stride;
+                }
+
+                // Bounds check
+                int totalSize = 1;
+                for (int d = 0; d < vartbl[varIdx].ndims; d++) totalSize *= (vartbl[varIdx].dims[d] + 1);
+                if (flatIdx < 0 || flatIdx >= totalSize) {
+                    MMBasic_Error(ERR_BOUNDS, "Array index out of bounds");
+                    return 1;
+                }
+
+                leftType = vartbl[varIdx].type;
+                if (leftType == T_STR) {
+                    leftSval = ((char **)vartbl[varIdx].arr)[flatIdx];
+                    leftIval = 0;
+                    leftFval = 0.0;
+                } else if (leftType == T_FLOAT) {
+                    leftFval = ((float *)vartbl[varIdx].arr)[flatIdx];
+                    leftIval = (int)leftFval;
+                    leftSval = NULL;
+                } else {
+                    leftIval = vartbl[varIdx].arr[flatIdx];
+                    leftFval = (float)leftIval;
+                    leftSval = NULL;
+                }
+            } else {
+                leftType = vartbl[varIdx].type;
+                leftIval = vartbl[varIdx].val.ival;
+                leftFval = vartbl[varIdx].val.fval;
+                leftSval = vartbl[varIdx].val.sval;
             }
         }
     }
@@ -1406,11 +1462,7 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
     while (**expr == ' ') (*expr)++;
     
     int compOp = 0;
-    if (**expr == '<' && (*expr)[1] == '<') {
-        // shift left - not a comparison, skip
-    } else if (**expr == '>' && (*expr)[1] == '>') {
-        // shift right - not a comparison, skip
-    } else if (**expr == '=' && (*expr)[1] != '=') {
+    if (**expr == '=' && (*expr)[1] != '=') {
         compOp = OP_EQ;
         (*expr)++;
     } else if (**expr == '<') {
@@ -1472,24 +1524,18 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
         leftSval = NULL;
     }
     
-    // Handle arithmetic operators (+, -, *, /, MOD, ^, \, <<, >>)
+    // Handle arithmetic operators (+, -, *, /, MOD, ^)
     while (**expr == ' ') (*expr)++;
     
     while (**expr == '+' || **expr == '-' || **expr == '*' || **expr == '/' || 
-           **expr == '^' || **expr == '\\' ||
-           strncmp(*expr, "MOD", 3) == 0 ||
-           strncmp(*expr, "<<", 2) == 0 ||
-           strncmp(*expr, ">>", 2) == 0) {
+           **expr == '^' || strncmp(*expr, "MOD", 3) == 0) {
         
         int op;
-        if (strncmp(*expr, "<<", 2) == 0) { op = OP_SHL; *expr += 2; }
-        else if (strncmp(*expr, ">>", 2) == 0) { op = OP_SHR; *expr += 2; }
-        else if (**expr == '+') { op = OP_PLUS; (*expr)++; }
+        if (**expr == '+') { op = OP_PLUS; (*expr)++; }
         else if (**expr == '-') { op = OP_MINUS; (*expr)++; }
         else if (**expr == '*') { op = OP_MULTIPLY; (*expr)++; }
         else if (**expr == '/') { op = OP_DIVIDE; (*expr)++; }
         else if (**expr == '^') { op = OP_POWER; (*expr)++; }
-        else if (**expr == '\\') { op = OP_DIVINT; (*expr)++; }
         else if (strncmp(*expr, "MOD", 3) == 0 && !isalpha((*expr)[3])) { op = OP_MOD; *expr += 3; }
         else break;
         
@@ -1552,19 +1598,6 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
             case OP_POWER:
                 lval = pow(lval, rval);
                 break;
-            case OP_SHL:
-                lval = (float)((int)lval << (int)rval);
-                break;
-            case OP_SHR:
-                lval = (float)((int)lval >> (int)rval);
-                break;
-            case OP_DIVINT:
-                if (rval == 0) {
-                    MMBasic_Error(ERR_DIV_ZERO, NULL);
-                    return 1;
-                }
-                lval = (float)((int)lval / (int)rval);
-                break;
         }
         
         // Determine result type
@@ -1572,10 +1605,6 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
             leftType = T_INT;
             leftIval = (int)lval;
             leftFval = lval;
-        } else if (op == OP_SHL || op == OP_SHR || op == OP_DIVINT) {
-            leftType = T_INT;
-            leftIval = (int)lval;
-            leftFval = (float)leftIval;
         } else {
             leftType = T_FLOAT;
             leftFval = lval;
@@ -1595,9 +1624,68 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
 
 // Evaluate a function call
 static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, float *fval, char **sval) {
+    // Special handling for BOUND() - needs variable name, not value
+    if (funcToken == F_BOUND) {
+        // Expect opening parenthesis
+        while (**expr == ' ') (*expr)++;
+        if (**expr != '(') { MMBasic_Error(ERR_SYNTAX, "Expected ("); return 1; }
+        (*expr)++;
+
+        // Parse variable name (including type suffix !, %, $)
+        while (**expr == ' ') (*expr)++;
+        char name[MAXVARLEN + 2];
+        int i = 0;
+        while ((**expr >= 'A' && **expr <= 'Z') || (**expr >= 'a' && **expr <= 'z') ||
+               (**expr >= '0' && **expr <= '9') || **expr == '_' || **expr == '$' ||
+               **expr == '!' || **expr == '%') {
+            if (i < MAXVARLEN + 1) name[i++] = **expr;
+            (*expr)++;
+        }
+        name[i] = '\0';
+        for (int j = 0; name[j]; j++) {
+            if (name[j] >= 'a' && name[j] <= 'z') name[j] = name[j] - 'a' + 'A';
+        }
+
+        // Skip optional ()
+        while (**expr == ' ') (*expr)++;
+        if (**expr == '(') { (*expr)++; while (**expr == ' ') (*expr)++; if (**expr == ')') (*expr)++; }
+
+        // Expect comma
+        while (**expr == ' ') (*expr)++;
+        if (**expr != ',') { MMBasic_Error(ERR_SYNTAX, "Expected ,"); return 1; }
+        (*expr)++;
+
+        // Parse dimension number
+        int dimType, dimIval;
+        float dimFval;
+        char *dimSval;
+        if (EvaluateExpression(expr, &dimType, &dimIval, &dimFval, &dimSval)) return 1;
+
+        // Expect closing parenthesis
+        while (**expr == ' ') (*expr)++;
+        if (**expr != ')') { MMBasic_Error(ERR_SYNTAX, "Expected )"); return 1; }
+        (*expr)++;
+
+        // Find variable and return bound
+        int varIdx = MMBasic_FindVariable(name);
+        if (varIdx < 0 || vartbl[varIdx].ndims == 0) {
+            *itype = T_INT; *ival = 0; *fval = 0;
+        } else {
+            int d = dimIval - 1; // BOUND uses 1-based dimension
+            if (d < 0 || d >= vartbl[varIdx].ndims) {
+                *itype = T_INT; *ival = 0; *fval = 0;
+            } else {
+                *itype = T_INT;
+                *ival = vartbl[varIdx].dims[d];
+                *fval = (float)*ival;
+            }
+        }
+        return 0;
+    }
+
     // Functions that don't require parentheses
     int noArg = (funcToken == F_RND || funcToken == F_PI || funcToken == F_DATE || funcToken == F_TIME);
-    
+
     // Skip optional opening parenthesis
     int hasParen = 0;
     if (**expr == '(') {
@@ -1607,7 +1695,7 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
         MMBasic_Error(ERR_SYNTAX, "Expected (");
         return 1;
     }
-    
+
     // Get argument(s)
     int arg1Type = T_INT, arg1Ival = 0;
     float arg1Fval = 0;
@@ -1666,7 +1754,7 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
             break;
         case F_INT:
             *itype = T_INT;
-            *ival = (int)floor(numVal);
+            *ival = (int)numVal;
             *fval = (float)*ival;
             break;
         case F_SGN:
@@ -1794,10 +1882,26 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
         case F_INSTR:
             *itype = T_INT;
             *ival = 0;
-            if (arg1Type == T_STR && arg2Type == T_STR) {
-                char *pos = strstr(arg1Sval, arg2Sval);
-                if (pos != NULL) {
-                    *ival = (int)(pos - arg1Sval) + 1; // 1-based
+            if (hasArg3) {
+                // 3-parameter form: INSTR(haystack$, needle$, start)
+                if (arg1Type == T_STR && arg2Type == T_STR) {
+                    int startPos = arg3Ival; // 1-based BASIC start position
+                    int slen = strlen(arg1Sval);
+                    if (startPos < 1) startPos = 1;
+                    if (startPos <= slen) {
+                        char *pos = strstr(arg1Sval + startPos - 1, arg2Sval);
+                        if (pos != NULL) {
+                            *ival = (int)(pos - arg1Sval) + 1; // 1-based
+                        }
+                    }
+                }
+            } else {
+                // 2-parameter form: INSTR(haystack$, needle$)
+                if (arg1Type == T_STR && arg2Type == T_STR) {
+                    char *pos = strstr(arg1Sval, arg2Sval);
+                    if (pos != NULL) {
+                        *ival = (int)(pos - arg1Sval) + 1; // 1-based
+                    }
                 }
             }
             *fval = (float)*ival;
@@ -2085,41 +2189,6 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
             *ival = touchRead(arg1Ival);
             *fval = *ival;
             break;
-        case F_EVAL: {
-            *itype = T_STR;
-            if (arg1Type == T_STR && arg1Sval) {
-                int t2, i2; float f2; char *s2;
-                char *copy = (char*)malloc(strlen(arg1Sval)+1);
-                strcpy(copy, arg1Sval);
-                char *p = copy;
-                if (MMBasic_EvaluateExpression(&p, &t2, &i2, &f2, &s2)==0) {
-                    if (t2 == T_STR) *sval = s2;
-                    else {
-                        *sval = MMBasic_GetTempString();
-                        if (t2 == T_FLOAT) sprintf(*sval, "%g", f2);
-                        else sprintf(*sval, "%d", i2);
-                    }
-                }
-                free(copy);
-            }
-            break;
-        }
-        case F_BASE: {
-            *itype = T_STR;
-            *sval = MMBasic_GetTempString();
-            int b = arg1Ival; if (b<2) b=2; if (b>36) b=36;
-            unsigned long long n = hasArg2 ? (unsigned long long)arg2Ival : 0;
-            char tmp[65]; int di=0;
-            do {
-                int d = n % b;
-                tmp[di++] = (d<10) ? ('0'+d) : ('A'+d-10);
-                n /= b;
-            } while (n>0 && di<64);
-            // Reverse
-            for (int i=0; i<di; i++) (*sval)[i] = tmp[di-1-i];
-            (*sval)[di] = 0;
-            break;
-        }
         case F_RGB:
             *itype = T_INT;
             *ival = ((arg1Ival & 0xF8) << 8) | ((arg2Ival & 0xFC) << 3) | ((arg3Ival & 0xF8) >> 3);
@@ -2130,54 +2199,196 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
             *ival = M5Cardputer.Display.readPixel(arg1Ival, arg2Ival) & 0xFFFF;
             *fval = *ival;
             break;
-        case F_FIX:
+        case F_EVAL: {
             *itype = T_INT;
-            if (arg1Type == T_INT) *ival = arg1Ival;
-            else *ival = (int)arg1Fval;  // truncate toward zero
+            *ival = 0;
+            if (arg1Type == T_STR && arg1Sval != NULL) {
+                // Evaluate the expression string
+                int eType, eIval;
+                float eFval;
+                char *eSval;
+                char evalBuf[STRINGSIZE];
+                strncpy(evalBuf, arg1Sval, STRINGSIZE - 1);
+                evalBuf[STRINGSIZE - 1] = '\0';
+                char *p = evalBuf;
+                if (!MMBasic_EvaluateExpression(&p, &eType, &eIval, &eFval, &eSval)) {
+                    *itype = eType;
+                    *ival = eIval;
+                    *fval = eFval;
+                    if (eType == T_STR && eSval != NULL) {
+                        *sval = MMBasic_GetTempString();
+                        strcpy(*sval, eSval);
+                    }
+                }
+            }
             *fval = (float)*ival;
             break;
-        case F_CHOICE: {
-            // CHOICE(cond, true_val, false_val) - args already parsed as arg1, arg2, arg3
-            // But we need to evaluate only the selected branch as expression strings
-            // Since args are already evaluated, use arg2 if cond is nonzero, arg3 otherwise
-            int cond = (arg1Type == T_STR) ? (arg1Sval && arg1Sval[0]) : arg1Ival;
-            if (cond) {
-                *itype = arg2Type;
-                *ival = arg2Ival; *fval = arg2Fval;
-                if (arg2Type == T_STR && arg2Sval) {
-                    *sval = MMBasic_GetTempString();
-                    strncpy(*sval, arg2Sval, STRINGSIZE - 1);
-                    (*sval)[STRINGSIZE - 1] = '\0';
-                }
-            } else {
-                *itype = arg3Type;
-                *ival = arg3Ival; *fval = arg3Fval;
-                if (arg3Type == T_STR && arg3Sval) {
-                    *sval = MMBasic_GetTempString();
-                    strncpy(*sval, arg3Sval, STRINGSIZE - 1);
-                    (*sval)[STRINGSIZE - 1] = '\0';
+        }
+        case F_INKEY: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            (*sval)[0] = '\0';
+            if (HAL_Keyboard_Available()) {
+                char c = HAL_Keyboard_Read();
+                if (c >= 32 || c == 13 || c == 10) {
+                    (*sval)[0] = c;
+                    (*sval)[1] = '\0';
                 }
             }
             break;
         }
-        case F_BOUND: {
-            // BOUND("varname") or BOUND("varname", dim)
-            // Takes variable name as string literal
+        case F_KEYDOWN: {
             *itype = T_INT;
             *ival = 0;
-            int which = hasArg2 ? arg2Ival : 1;
-            if (arg1Type == T_STR && arg1Sval && arg1Sval[0]) {
-                char name[MAXVARLEN + 1];
-                strncpy(name, arg1Sval, MAXVARLEN);
-                name[MAXVARLEN] = '\0';
-                for (int j = 0; name[j]; j++)
-                    if (name[j] >= 'a' && name[j] <= 'z') name[j] -= 32;
-                int vi = MMBasic_FindVariable(name);
-                if (vi >= 0 && vartbl[vi].array > 0) {
-                    *ival = (which == 0) ? 0 : vartbl[vi].array;
-                }
+            // KEYDOWN returns 1 if a key is available, 0 otherwise
+            if (arg1Ival == 0) {
+                // No argument - check if any key available
+                *ival = HAL_Keyboard_Available() ? 1 : 0;
+            } else {
+                // Check specific key code
+                *ival = HAL_Keyboard_Available() ? 1 : 0;
             }
             *fval = (float)*ival;
+            break;
+        }
+        case F_VERSION: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            strcpy(*sval, "6.03.00");
+            break;
+        }
+        case F_TIMER: {
+            *itype = T_INT;
+            *ival = (int)millis();
+            *fval = (float)*ival;
+            break;
+        }
+        case F_MM_HRES: {
+            *itype = T_INT;
+            *ival = 240;
+            *fval = 240.0f;
+            break;
+        }
+        case F_MM_VRES: {
+            *itype = T_INT;
+            *ival = 135;
+            *fval = 135.0f;
+            break;
+        }
+        case F_MM_WIDTH: {
+            *itype = T_INT;
+            *ival = 40;  // 240 / 6 = 40 chars
+            *fval = 40.0f;
+            break;
+        }
+        case F_MM_HEIGHT: {
+            *itype = T_INT;
+            *ival = 16;  // 135 / 8 = 16.875, round down
+            *fval = 16.0f;
+            break;
+        }
+        case F_MM_HPOS: {
+            *itype = T_INT;
+            *ival = MMCharPos;
+            *fval = (float)*ival;
+            break;
+        }
+        case F_MM_VPOS: {
+            *itype = T_INT;
+            *ival = 0;  // TODO: track vertical position
+            *fval = 0.0f;
+            break;
+        }
+        case F_MM_DEVICE: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            strcpy(*sval, "M5Cardputer");
+            break;
+        }
+        case F_MM_FONTWIDTH: {
+            *itype = T_INT;
+            *ival = 6;
+            *fval = 6.0f;
+            break;
+        }
+        case F_MM_FONTHEIGHT: {
+            *itype = T_INT;
+            *ival = 8;
+            *fval = 8.0f;
+            break;
+        }
+        case F_MM_ERRNO: {
+            *itype = T_INT;
+            *ival = 0;  // TODO: track error number
+            *fval = 0.0f;
+            break;
+        }
+        case F_MM_ERRMSG: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            (*sval)[0] = '\0';  // TODO: track error message
+            break;
+        }
+        case F_MM_FLAGS: {
+            *itype = T_INT;
+            *ival = 0;  // TODO: user flags
+            *fval = 0.0f;
+            break;
+        }
+        case F_MM_DISPLAY: {
+            *itype = T_INT;
+            *ival = 1;  // LCD type
+            *fval = 1.0f;
+            break;
+        }
+        case F_MM_SUPPLY: {
+            *itype = T_FLOAT;
+            // Read battery voltage if available
+            *fval = 3.3f;  // Default
+            *ival = (int)*fval;
+            break;
+        }
+        case F_MM_INFO: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            strcpy(*sval, "M5Cardputer ESP32-S3");
+            break;
+        }
+        case F_CWD: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            strcpy(*sval, "/");
+            break;
+        }
+        case F_DIR: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            (*sval)[0] = '\0';
+            // TODO: Implement directory iteration
+            break;
+        }
+        case F_FIELD: {
+            *itype = T_STR;
+            *sval = MMBasic_GetTempString();
+            (*sval)[0] = '\0';
+            // FIELD$(str$, n [, delim$])
+            if (arg1Type == T_STR && arg1Sval != NULL) {
+                int n = arg2Ival;
+                char delim = (arg3Type == T_STR && arg3Sval != NULL && arg3Sval[0] != '\0') ? arg3Sval[0] : ',';
+                char *p = arg1Sval;
+                int field = 1;
+                while (*p && field < n) {
+                    if (*p == delim) field++;
+                    p++;
+                }
+                if (field == n) {
+                    int i = 0;
+                    while (*p && *p != delim && i < STRINGSIZE - 1) {
+                        (*sval)[i++] = *p++;
+                    }
+                    (*sval)[i] = '\0';
+                }
+            }
             break;
         }
         default:
@@ -2194,6 +2405,5 @@ int MMBasic_EvaluateExpression(char **expr, int *itype, int *ival, float *fval, 
 }
 
 // ============================================================================
-
-
-
+// Command implementations are in MMBasic_cmds.cpp
+// ============================================================================
