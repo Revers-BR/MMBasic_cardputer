@@ -1,10 +1,4 @@
-/*
- * MMBasic.c - MMBasic Core Implementation
- * 
- * This file implements the core MMBasic interpreter for M5Cardputer
- */
-
-#include "MMBasic.h"
+ic.h"
 #include "HAL.h"
 #include <Wire.h>
 #include <string.h>
@@ -41,6 +35,7 @@ char *currentLine = NULL;
 int currentLineIndex = -1;
 bool flowControlActive = false; // Set true when a command changes line flow
 bool traceOn = false;            // TRACE ON/OFF
+bool skipRestOfLine = false;     // Set true when IF condition is false, skip remaining sub-statements on line
 int MMBasic_ForSingleLine = 0;  // Set true when line has FOR...NEXT on same line
 
 // FOR loop stack
@@ -433,13 +428,24 @@ char *MMBasic_GetToken(char *line, char *token) {
         return line;
     }
     
-    // Check for string literal
+    // Check for string literal (with "" escape for quote inside string)
     if (*line == '"') {
         line++;
-        while (*line != '"' && *line != '\0' && i < STRINGSIZE - 1) {
-            token[i++] = *line++;
+        while (*line != '\0' && i < STRINGSIZE - 1) {
+            if (*line == '"') {
+                if (*(line + 1) == '"') {
+                    // "" escape - add single quote to token
+                    token[i++] = '"';
+                    line += 2;
+                } else {
+                    // End of string
+                    line++;
+                    break;
+                }
+            } else {
+                token[i++] = *line++;
+            }
         }
-        if (*line == '"') line++;
         token[i] = '\0';
         return line;
     }
@@ -471,10 +477,10 @@ char *MMBasic_GetToken(char *line, char *token) {
         return line;
     }
     
-    // Check for variable or keyword (including $/%/! for type suffixes)
+    // Check for variable or keyword (including $/%/! for type suffixes, and . for MM.xxx functions)
     while ((*line >= 'A' && *line <= 'Z') || (*line >= 'a' && *line <= 'z') || 
            (*line >= '0' && *line <= '9') || *line == '_' || *line == '$' ||
-           *line == '%' || *line == '!') {
+           *line == '%' || *line == '!' || *line == '.') {
         if (i < STRINGSIZE - 1) token[i++] = *line++;
     }
     token[i] = '\0';
@@ -1046,6 +1052,7 @@ void MMBasic_Execute(char *line) {
     }
     
     // Execute each sub-statement in sequence
+    skipRestOfLine = false; // Reset at start of line
     for (int si = 0; si < stmtCount; si++) {
         // If sub-statement is REM or ', skip rest of line
         char subTok[STRINGSIZE];
@@ -1058,6 +1065,12 @@ void MMBasic_Execute(char *line) {
         
         // If flow was redirected (GOTO, loop back, etc.), stop processing
         if (flowControlActive) break;
+        
+        // If IF condition was false, skip remaining sub-statements on this line
+        if (skipRestOfLine) {
+            skipRestOfLine = false; // Reset for next line
+            break;
+        }
     }
 }
 
@@ -1291,6 +1304,10 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
     // Parse the primary value
     while (**expr == ' ') (*expr)++;
     
+    // Debug: show what we're about to parse
+    char dbgCh = **expr;
+    // HAL_Display_Print("EvalFactor ch="); HAL_Print(dbgCh); HAL_Println(""); // Uncomment to debug
+    
     // Check for parentheses
     if (**expr == '(') {
         (*expr)++;
@@ -1316,17 +1333,28 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
         leftIval = atoi(numStr);
         leftFval = (float)leftIval;
     }
-    // Check for string literal
+    // Check for string literal (with "" escape for quote inside string)
     else if (**expr == '"') {
         (*expr)++;
         leftSval = MMBasic_GetTempString();
         int i = 0;
-        while (**expr != '"' && **expr != '\0' && i < STRINGSIZE - 1) {
-            leftSval[i++] = **expr;
-            (*expr)++;
+        while (**expr != '\0' && i < STRINGSIZE - 1) {
+            if (**expr == '"') {
+                if (*(*expr + 1) == '"') {
+                    // "" escape - add single quote to string
+                    leftSval[i++] = '"';
+                    *expr += 2;
+                } else {
+                    // End of string
+                    (*expr)++;
+                    break;
+                }
+            } else {
+                leftSval[i++] = **expr;
+                (*expr)++;
+            }
         }
         leftSval[i] = '\0';
-        if (**expr == '"') (*expr)++;
         leftType = T_STR;
         leftIval = 0;
         leftFval = 0.0;
@@ -1354,13 +1382,13 @@ static int EvaluateFactor(char **expr, int *itype, int *ival, float *fval, char 
         }
         leftSval = NULL;
     }
-    // Check for function or variable
+    // Check for function or variable (including . for MM.xxx functions)
     else if ((*expr[0] >= 'A' && *expr[0] <= 'Z') || (*expr[0] >= 'a' && *expr[0] <= 'z')) {
         char name[MAXVARLEN + 2]; // +2 for $ and null
         int i = 0;
         while ((**expr >= 'A' && **expr <= 'Z') || (**expr >= 'a' && **expr <= 'z') || 
                (**expr >= '0' && **expr <= '9') || **expr == '_' || **expr == '$' ||
-               **expr == '%' || **expr == '!') {
+               **expr == '%' || **expr == '!' || **expr == '.') {
             if (i < MAXVARLEN + 1) name[i++] = **expr;
             (*expr)++;
         }
@@ -1684,7 +1712,14 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
     }
 
     // Functions that don't require parentheses
-    int noArg = (funcToken == F_RND || funcToken == F_PI || funcToken == F_DATE || funcToken == F_TIME);
+    int noArg = (funcToken == F_RND || funcToken == F_PI || funcToken == F_DATE || funcToken == F_TIME ||
+                 funcToken == F_VERSION || funcToken == F_INKEY ||
+                 funcToken == F_MM_HRES || funcToken == F_MM_VRES || funcToken == F_MM_WIDTH || funcToken == F_MM_HEIGHT ||
+                 funcToken == F_MM_HPOS || funcToken == F_MM_VPOS || funcToken == F_MM_DEVICE ||
+                 funcToken == F_MM_FONTWIDTH || funcToken == F_MM_FONTHEIGHT ||
+                 funcToken == F_MM_ERRNO || funcToken == F_MM_ERRMSG || funcToken == F_MM_FLAGS ||
+                 funcToken == F_MM_DISPLAY || funcToken == F_MM_SUPPLY || funcToken == F_MM_INFO ||
+                 funcToken == F_CWD || funcToken == F_TIMER);
 
     // Skip optional opening parenthesis
     int hasParen = 0;
@@ -2130,13 +2165,56 @@ static int EvaluateFunction(char **expr, int funcToken, int *itype, int *ival, f
         case F_FORMAT: {
             *itype = T_STR;
             *sval = MMBasic_GetTempString();
-            const char* fmt = hasArg2 ? arg2Sval : "%g";
-            // Use integer or float based on format specifier
-            if (strchr(fmt, 'd') || strchr(fmt, 'x') || strchr(fmt, 'X') ||
-                strchr(fmt, 'u') || strchr(fmt, 'c') || strchr(fmt, 'o'))
-                sprintf(*sval, fmt, arg1Ival);
-            else
-                sprintf(*sval, fmt, numVal);
+            (*sval)[0] = '\0';
+            
+            // Determine argument order (support both PicoMite and legacy syntax)
+            // PicoMite: FORMAT$(value, format$)
+            // Legacy:   FORMAT$(format$, value)
+            const char* fmt = NULL;
+            int valIval;
+            float valFval;
+            char *valSval = NULL;
+            
+            if (hasArg2 && arg2Type == T_STR && arg2Sval != NULL) {
+                // Second arg is string - could be format
+                // Check if first arg looks like a format string too
+                if (arg1Type == T_STR && arg1Sval != NULL && strchr(arg1Sval, '%')) {
+                    // Both are strings with % - first is probably format (legacy)
+                    fmt = arg1Sval;
+                    valIval = arg2Ival;
+                    valFval = (arg2Type == T_FLOAT) ? arg2Fval : (float)arg2Ival;
+                    valSval = arg2Sval;
+                } else {
+                    // Second arg is format, first is value (PicoMite)
+                    fmt = arg2Sval;
+                    valIval = arg1Ival;
+                    valFval = numVal;
+                    valSval = arg1Sval;
+                }
+            } else if (arg1Type == T_STR && arg1Sval != NULL) {
+                // Only first arg is string - it's the format
+                fmt = arg1Sval;
+                valIval = hasArg2 ? arg2Ival : 0;
+                valFval = hasArg2 ? ((arg2Type == T_FLOAT) ? arg2Fval : (float)arg2Ival) : 0;
+                valSval = hasArg2 ? arg2Sval : NULL;
+            }
+            
+            if (fmt == NULL || fmt[0] == '\0') {
+                fmt = "%g"; // Default format
+            }
+            
+            // Format based on specifier type
+            if (strchr(fmt, 's')) {
+                // String format - pass string pointer
+                sprintf(*sval, fmt, valSval ? valSval : "");
+            } else if (strchr(fmt, 'd') || strchr(fmt, 'x') || strchr(fmt, 'X') ||
+                strchr(fmt, 'u') || strchr(fmt, 'c') || strchr(fmt, 'o')) {
+                // Integer format
+                sprintf(*sval, fmt, valIval);
+            } else {
+                // Float format
+                sprintf(*sval, fmt, valFval);
+            }
             break;
         }
         case F_SCHANGE: {
