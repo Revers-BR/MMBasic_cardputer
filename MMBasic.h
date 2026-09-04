@@ -1,4 +1,13 @@
+/*
+ * MMBasic.h - MMBasic Core Header
+ * 
+ * This file defines the core structures and functions for MMBasic
+ */
 
+#ifndef MMBASIC_H
+#define MMBASIC_H
+
+#include <stdint.h>
 #include <stdbool.h>
 #include <setjmp.h>
 #include "MMBasic_Config.h"
