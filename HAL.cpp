@@ -235,13 +235,13 @@ void HAL_Keyboard_Init(void) {
 
 bool HAL_Keyboard_Available(void) {
     M5Cardputer.update();
-    return M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
+    return M5Cardputer.Keyboard.isPressed();
 }
 
 char HAL_Keyboard_Read(void) {
     M5Cardputer.update();
     
-    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
+    if (!M5Cardputer.Keyboard.isPressed()) {
         return 0;
     }
     
