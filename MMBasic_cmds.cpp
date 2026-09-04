@@ -33,6 +33,8 @@ extern char BreakKey;
 extern char *currentLine;
 extern int currentLineIndex;
 extern bool flowControlActive;
+extern bool skipRestOfLine;
+extern int MMBasic_ForSingleLine;
 extern bool traceOn;
 extern int linecnt;
 extern char *lines[1000];
@@ -641,6 +643,16 @@ void MMBasic_CmdImplicitLet(char *line) {
         return;
     }
 
+    // Debug: show what line starts with (to serial)
+    {
+        char dbgLine[32];
+        strncpy(dbgLine, line, 20);
+        dbgLine[20] = '\0';
+        char dbgOut[48];
+        sprintf(dbgOut, "ImplLet line=[%s]", dbgLine);
+        Serial.println(dbgOut);
+    }
+
     // Get variable name (including type suffix !, %, $)
     char varName[MAXVARLEN + 2];
     int i = 0;
@@ -661,11 +673,18 @@ void MMBasic_CmdImplicitLet(char *line) {
 
     // Find or create variable (need it early for array check)
     int varIdx = MMBasic_FindVariable(varName);
+    // Debug output (to serial)
+    char dbg[64];
+    sprintf(dbg, "Var [%s] found=%d", varName, varIdx);
+    Serial.println(dbg);
     if (varIdx < 0) {
         char type = MMBasic_GetVarType(varName);
         varIdx = MMBasic_CreateVariable(varName, type);
         if (varIdx < 0) return;
     }
+    // Debug: show type
+    sprintf(dbg, "  type=%d ndims=%d", vartbl[varIdx].type, vartbl[varIdx].ndims);
+    Serial.println(dbg);
 
     // Check for array element assignment: A(i) = expr or A(i,j) = expr
     int arrFlatIdx = -1;
@@ -773,6 +792,9 @@ void MMBasic_CmdIf(void) {
         if (ival) {
             // Execute THEN part
             MMBasic_Execute(line);
+        } else {
+            // Condition is false - skip remaining sub-statements on this line
+            skipRestOfLine = true;
         }
     } else {
         // Simple IF without THEN
@@ -802,6 +824,15 @@ void MMBasic_CmdFor(void) {
     for (int j = 0; varName[j]; j++) {
         if (varName[j] >= 'a' && varName[j] <= 'z') {
             varName[j] = varName[j] - 'a' + 'A';
+        }
+    }
+    
+    // Check if this is a re-execution of a single-line FOR (NEXT already managing the loop)
+    // If the variable is already in the FOR stack and we're re-executing, just skip initialization
+    for (int k = forstackptr - 1; k >= 0; k--) {
+        if (strcmp(forstack[k].varname, varName) == 0) {
+            // Variable already in FOR stack - this is a re-execution, skip FOR setup
+            return;
         }
     }
     
@@ -861,7 +892,8 @@ void MMBasic_CmdFor(void) {
         return;
     }
     
-    forstack[forstackptr].lineIdx = currentLineIndex + 1; // Loop body starts at next line
+    // For single-line FOR, loop back to current line; otherwise next line
+    forstack[forstackptr].lineIdx = MMBasic_ForSingleLine ? currentLineIndex : (currentLineIndex + 1);
     strcpy(forstack[forstackptr].varname, varName);
     forstack[forstackptr].varindex = varIdx;
     forstack[forstackptr].toval = endIval;
@@ -1183,6 +1215,16 @@ void MMBasic_CmdReturn(void) {
 void MMBasic_CmdEnd(void) {
     char *line = currentLine;
     while (*line == ' ') line++;
+    // Check for END SUB / END FUNCTION / END SELECT
+    // Note: after tokenization, keywords become single-byte tokens
+    // SUB=0xA5, FUNCTION=0xA7, SELECT=0xAA
+    if (*line == C_SUB || *line == C_FUNCTION) {
+        MMBasic_CmdEndSubFun(); return;
+    }
+    if (*line == C_SELECT) {
+        MMBasic_CmdEndSelect(); return;
+    }
+    // Also check for untokenized form (direct mode or if tokenizer didn't run)
     if ((line[0]=='S'||line[0]=='s')&&(line[1]=='U'||line[1]=='u')&&(line[2]=='B'||line[2]=='b')) {
         MMBasic_CmdEndSubFun(); return;
     }
@@ -1498,6 +1540,13 @@ void MMBasic_LoadProgram(char *filename) {
                 // Store line
                 char codeBuf[STRINGSIZE];
                 code.toCharArray(codeBuf, STRINGSIZE);
+                // Debug: show loaded line (to serial)
+                char dbgLoad[48];
+                strncpy(dbgLoad, codeBuf, 30);
+                dbgLoad[30] = '\0';
+                char dbgOut[64];
+                sprintf(dbgOut, "Load %d: [%s]", linenum, dbgLoad);
+                Serial.println(dbgOut);
                 MMBasic_StoreLine(linenum, codeBuf);
             }
         }
@@ -3771,27 +3820,37 @@ void MMBasic_CmdCase(void) {
     }
 }
 
-// Skip to next CASE or ENDSELECT at same nesting level
+// Skip to next CASE or END SELECT at same nesting level
 void MMBasic_SkipToNextCase(void) {
     int depth = 0;
     currentLineIndex++;
     while (currentLineIndex < linecnt) {
         const char *l = lines[currentLineIndex];
         while (*l == ' ' || *l == '\t') l++;
+        // Check for SELECT (nested)
         if ((l[0]=='S'||l[0]=='s') && (l[1]=='E'||l[1]=='e') &&
             (l[2]=='L'||l[2]=='l') && (l[3]=='E'||l[3]=='e') &&
-            (l[4]=='C'||l[4]=='c') && (l[5]=='T'||l[5]=='t')) {
+            (l[4]=='C'||l[4]=='c') && (l[5]=='T'||l[5]=='t') &&
+            (l[6]==' ' || l[6] == '\0' || !isalpha(l[6]))) {
             depth++;
-        } else if (depth == 0 && (l[0]=='C'||l[0]=='c') && (l[1]=='A'||l[1]=='a') &&
-                   (l[2]=='S'||l[2]=='s') && (l[3]=='E'||l[3]=='e')) {
+        }
+        // Check for CASE (at same nesting level)
+        else if (depth == 0 && (l[0]=='C'||l[0]=='c') && (l[1]=='A'||l[1]=='a') &&
+                   (l[2]=='S'||l[2]=='s') && (l[3]=='E'||l[3]=='e') &&
+                   (l[4]==' ' || l[4] == '\0' || !isalpha(l[4]))) {
             break; // Stop at next CASE, don't skip it
-        } else if ((l[0]=='E'||l[0]=='e') && (l[1]=='N'||l[1]=='n') &&
-                   (l[2]=='D'||l[2]=='d') && (l[3]=='S'||l[3]=='s') &&
-                   (l[4]=='E'||l[4]=='e') && (l[5]=='L'||l[5]=='l') &&
-                   (l[6]=='E'||l[6]=='e') && (l[7]=='C'||l[7]=='c') &&
-                   (l[8]=='T'||l[8]=='t')) {
-            if (depth == 0) { currentLineIndex++; break; }
-            depth--;
+        }
+        // Check for END SELECT (handles both "ENDSELECT" and "END SELECT")
+        else if ((l[0]=='E'||l[0]=='e') && (l[1]=='N'||l[1]=='n') &&
+                   (l[2]=='D'||l[2]=='d')) {
+            const char *p = l + 3;
+            while (*p == ' ') p++;
+            if ((p[0]=='S'||p[0]=='s') && (p[1]=='E'||p[1]=='e') &&
+                (p[2]=='L'||p[2]=='l') && (p[3]=='E'||p[3]=='e') &&
+                (p[4]=='C'||p[4]=='c') && (p[5]=='T'||p[5]=='t')) {
+                // Don't increment - let END SELECT execute to decrement selectptr
+                break;
+            }
         }
         currentLineIndex++;
     }
@@ -3805,17 +3864,24 @@ void MMBasic_SkipToEndSelect(void) {
     while (currentLineIndex < linecnt) {
         const char *l = lines[currentLineIndex];
         while (*l == ' ' || *l == '\t') l++;
+        // Check for SELECT (nested)
         if ((l[0]=='S'||l[0]=='s') && (l[1]=='E'||l[1]=='e') &&
             (l[2]=='L'||l[2]=='l') && (l[3]=='E'||l[3]=='e') &&
-            (l[4]=='C'||l[4]=='c') && (l[5]=='T'||l[5]=='t')) {
+            (l[4]=='C'||l[4]=='c') && (l[5]=='T'||l[5]=='t') &&
+            (l[6]==' ' || l[6] == '\0' || !isalpha(l[6]))) {
             depth++;
-        } else if ((l[0]=='E'||l[0]=='e') && (l[1]=='N'||l[1]=='n') &&
-                   (l[2]=='D'||l[2]=='d') && (l[3]=='S'||l[3]=='s') &&
-                   (l[4]=='E'||l[4]=='e') && (l[5]=='L'||l[5]=='l') &&
-                   (l[6]=='E'||l[6]=='e') && (l[7]=='C'||l[7]=='c') &&
-                   (l[8]=='T'||l[8]=='t')) {
-            if (depth == 0) { currentLineIndex++; break; }
-            depth--;
+        }
+        // Check for END SELECT (handles both "ENDSELECT" and "END SELECT")
+        else if ((l[0]=='E'||l[0]=='e') && (l[1]=='N'||l[1]=='n') &&
+                   (l[2]=='D'||l[2]=='d')) {
+            const char *p = l + 3;
+            while (*p == ' ') p++;
+            if ((p[0]=='S'||p[0]=='s') && (p[1]=='E'||p[1]=='e') &&
+                (p[2]=='L'||p[2]=='l') && (p[3]=='E'||p[3]=='e') &&
+                (p[4]=='C'||p[4]=='c') && (p[5]=='T'||p[5]=='t')) {
+                // Don't increment - let END SELECT execute to decrement selectptr
+                break;
+            }
         }
         currentLineIndex++;
     }
@@ -4712,21 +4778,50 @@ void MMBasic_CmdExecute(void) {
 void MMBasic_CmdDelete(void) {
     char *line = currentLine;
     while (*line == ' ') line++;
-    int itype, ival;
-    float fval;
-    char *sval;
-    if (MMBasic_EvaluateExpression(&line, &itype, &ival, &fval, &sval)) return;
-    int startLine = ival;
+    
+    // Parse start line number directly (don't use expression evaluator, which would treat - as minus)
+    int startLine = 0;
+    while (*line >= '0' && *line <= '9') {
+        startLine = startLine * 10 + (*line - '0');
+        line++;
+    }
     int endLine = startLine;
+    
+    // Check for range separator '-'
     while (*line == ' ') line++;
     if (*line == '-') {
         line++;
         while (*line == ' ') line++;
-        if (MMBasic_EvaluateExpression(&line, &itype, &ival, &fval, &sval)) return;
-        endLine = ival;
+        // Parse end line number
+        endLine = 0;
+        while (*line >= '0' && *line <= '9') {
+            endLine = endLine * 10 + (*line - '0');
+            line++;
+        }
     }
-    for (int j = startLine; j <= endLine; j++) {
+    
+    // Count how many lines will be deleted that are before or at currentLineIndex
+    int deletedBeforeCurrent = 0;
+    int currentLineNum = (currentLineIndex >= 0 && currentLineIndex < linecnt) ? lineNumbers[currentLineIndex] : -1;
+    
+    // Delete lines in range (from high to low to avoid index shifting issues)
+    for (int j = endLine; j >= startLine; j--) {
+        // Check if this line is before the current execution point
+        for (int k = 0; k < linecnt; k++) {
+            if (lineNumbers[k] == j) {
+                if (j <= currentLineNum) {
+                    deletedBeforeCurrent++;
+                }
+                break;
+            }
+        }
         MMBasic_StoreLine(j, NULL);
+    }
+    
+    // Adjust currentLineIndex to account for deleted lines
+    if (deletedBeforeCurrent > 0) {
+        currentLineIndex -= deletedBeforeCurrent;
+        if (currentLineIndex < 0) currentLineIndex = 0;
     }
 }
 
